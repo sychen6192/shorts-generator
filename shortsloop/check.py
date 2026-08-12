@@ -148,9 +148,14 @@ def main(argv: list[str] | None = None) -> int:
             judge_cfg = load_judge_config(args.config)
             floors = thresholds["l2"]["floors"]
             t1 = time.monotonic()
-            l2_block = l2.run_l2(clip_path, container, prompt_text, judge_cfg, floors)
+            l2_block, l2_raw = l2.run_l2(clip_path, container, prompt_text,
+                                         judge_cfg, floors)
             layers_run.append("l2")
             timing["l2_s"] = round(time.monotonic() - t1, 3)
+            if args.json_out:  # raw judge output kept for audit next to the verdict
+                raw_path = Path(args.json_out).with_suffix(".l2_raw.json")
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(l2_raw, encoding="utf-8")
 
     except CheckError as e:
         error_obj = e.as_error_obj()

@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "shortsloop verdict v1 (FROZEN — docs/plan.md §2.2)",
+  "type": "object",
+  "required": ["schema_version", "verdict", "failure_classes", "error", "clip",
+               "prompt", "l1", "l2", "thresholds", "layers_run", "timing", "versions"],
+  "properties": {
+    "schema_version": {"enum": ["1"]},
+    "verdict": {"enum": ["PASS", "FAIL", "ERROR", "PROCEED"]},
+    "failure_classes": {
+      "type": "array",
+      "items": {"enum": ["broken", "black", "static", "deformed", "flicker",
+                          "off_prompt", "blurry"]}
+    },
+    "error": {
+      "type": ["object", "null"],
+      "required": ["scope", "stage", "message"],
+      "properties": {
+        "scope": {"enum": ["clip", "infra"]},
+        "stage": {"enum": ["probe", "l1", "l2"]},
+        "message": {"type": "string"}
+      }
+    },
+    "clip": {
+      "type": "object",
+      "required": ["path", "sha256", "container"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"type": ["string", "null"]},
+        "container": {
+          "type": ["object", "null"],
+          "required": ["duration_s", "width", "height", "fps", "nb_frames", "vcodec"],
+          "properties": {
+            "duration_s": {"type": ["number", "null"]},
+            "width": {"type": "integer"},
+            "height": {"type": "integer"},
+            "fps": {"type": ["number", "null"]},
+            "nb_frames": {"type": ["integer", "null"]},
+            "vcodec": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "required": ["text", "sha256"],
+      "properties": {
+        "text": {"type": ["string", "null"]},
+        "sha256": {"type": ["string", "null"]}
+      }
+    },
+    "l1": {
+      "type": ["object", "null"],
+      "required": ["analysis", "metrics", "checks", "pass"],
+      "properties": {
+        "analysis": {
+          "type": "object",
+          "required": ["width", "height", "flow_downscale", "frames_analyzed"],
+          "properties": {
+            "width": {"type": "integer"},
+            "height": {"type": "integer"},
+            "flow_downscale": {"type": "integer"},
+            "frames_analyzed": {"type": "integer"}
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "required": ["flow_mag_median", "flow_mag_p90", "ssim_min", "ssim_p05",
+                       "ssim_mean", "flicker_dips", "freeze_longest_run_s",
+                       "laplacian_p10", "laplacian_median", "luma_mean",
+                       "black_frame_frac", "clipped_frac"]
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "metric", "op", "threshold", "value", "pass", "reason"],
+            "properties": {
+              "name": {"type": "string"},
+              "metric": {"type": "string"},
+              "op": {"type": "string"},
+              "threshold": {"type": ["number", "null"]},
+              "value": {"type": ["number", "null"]},
+              "pass": {"type": "boolean"},
+              "reason": {"type": "string"}
+            }
+          }
+        },
+        "pass": {"type": "boolean"}
+      }
+    },
+    "l2": {
+      "type": ["object", "null"],
+      "required": ["model", "model_digest", "temperature", "seed", "frames",
+                   "dimensions", "pass", "raw_response_sha256"],
+      "properties": {
+        "model": {"type": "string"},
+        "model_digest": {"type": "string"},
+        "temperature": {"type": "number"},
+        "seed": {"type": "integer"},
+        "frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["index", "t"],
+            "properties": {"index": {"type": "integer"}, "t": {"type": "number"}}
+          }
+        },
+        "dimensions": {
+          "type": "object",
+          "required": ["prompt_adherence", "subject_consistency", "anatomy_artifacts",
+                       "temporal_coherence", "imaging_quality"],
+          "additionalProperties": false,
+          "properties": {
+            "prompt_adherence": {"$ref": "#/$defs/dimension"},
+            "subject_consistency": {"$ref": "#/$defs/dimension"},
+            "anatomy_artifacts": {"$ref": "#/$defs/dimension"},
+            "temporal_coherence": {"$ref": "#/$defs/dimension"},
+            "imaging_quality": {"$ref": "#/$defs/dimension"}
+          }
+        },
+        "pass": {"type": "boolean"},
+        "raw_response_sha256": {"type": "string"}
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "required": ["version", "calibrated", "file_sha256"],
+      "properties": {
+        "version": {"type": ["string", "null"]},
+        "calibrated": {"type": "boolean"},
+        "file_sha256": {"type": ["string", "null"]}
+      }
+    },
+    "layers_run": {"type": "array", "items": {"enum": ["l1", "l2"]}},
+    "timing": {
+      "type": "object",
+      "required": ["l1_s", "l2_s"],
+      "properties": {
+        "l1_s": {"type": ["number", "null"]},
+        "l2_s": {"type": ["number", "null"]}
+      }
+    },
+    "versions": {"type": "object"}
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "required": ["score", "floor", "na", "pass", "reason"],
+      "properties": {
+        "score": {"type": "integer", "minimum": 1, "maximum": 5},
+        "floor": {"type": "integer"},
+        "na": {"type": "boolean"},
+        "pass": {"type": "boolean"},
+        "reason": {"type": "string"}
+      }
+    }
+  }
+}

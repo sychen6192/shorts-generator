@@ -9,7 +9,7 @@ from pathlib import Path
 
 from conftest import write_thresholds
 
-from shortsloop.verdict import validate
+from shortsloop.schema import validate_verdict_file
 
 
 def run_check(*args: str) -> tuple[int, dict, str]:
@@ -24,8 +24,11 @@ def run_check(*args: str) -> tuple[int, dict, str]:
 
 
 def load_verdict(path: Path) -> dict:
+    """Every verdict any test touches must satisfy the frozen JSON Schema AND the
+    cross-field invariants (plan §5 row 17)."""
     v = json.loads(path.read_text(encoding="utf-8"))
-    assert validate(v) == [], f"verdict violates invariants: {validate(v)}"
+    problems = validate_verdict_file(v)
+    assert problems == [], f"verdict violates schema/invariants: {problems}"
     return v
 
 

@@ -23,5 +23,8 @@ shortsloop-check = "shortsloop.check:main"
 [tool.setuptools.packages.find]
 include = ["shortsloop*"]
 
+[tool.setuptools.package-data]
+shortsloop = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
