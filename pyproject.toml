@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shortsloop"
+version = "0.1.0"
+description = "Unattended nightly Wan 2.2 short-video pipeline: generate, judge, re-roll, encode survivors, morning report"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+shortsloop = "shortsloop.cli:main"
+shortsloop-check = "shortsloop.check:main"
+
+[tool.setuptools.packages.find]
+include = ["shortsloop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

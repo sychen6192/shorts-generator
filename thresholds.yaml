@@ -1,0 +1,29 @@
+# shortsloop L1/L2 decision thresholds.
+# PLACEHOLDER values — calibrated: false means the nightly runner REFUSES to run
+# unattended. Phase 0 (docs/plan.md §6) replaces these via `shortsloop calibrate-tune`
+# and flips calibrated: true with provenance.
+version: "2026-08-12.0"
+calibrated: false
+provenance:
+  labels_sha256: null
+  tuned_at: null
+  tune_test_split: null
+  test_agreement: null
+  test_false_pass: null
+l1:
+  motion:     {metric: flow_mag_median,      op: ">=", value: 0.0015}
+  freeze:     {metric: freeze_longest_run_s, op: "<=", value: 1.5}
+  flicker:    {metric: flicker_dips,         op: "<=", value: 2}
+  # NB: fast legitimate motion drives ssim_min well below 0.7 — this floor only
+  # catches catastrophic frame discontinuities until Phase 0 tunes it properly.
+  ssim_floor: {metric: ssim_min,             op: ">=", value: 0.35}
+  sharpness:  {metric: laplacian_p10,        op: ">=", value: 20.0}
+  black:      {metric: black_frame_frac,     op: "<=", value: 0.10}
+  exposure:   {metric: clipped_frac,         op: "<=", value: 0.20}
+l2:
+  floors:
+    prompt_adherence: 3
+    subject_consistency: 3
+    anatomy_artifacts: 3
+    temporal_coherence: 3
+    imaging_quality: 3

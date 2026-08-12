@@ -1,0 +1,23 @@
+# Machine-local configuration. Copy to config.yaml (gitignored) on the workstation;
+# `shortsloop doctor` verifies every value and writes a skeleton if none exists.
+comfy:
+  host: "127.0.0.1:8188"            # LAN/Tailscale only — ComfyUI has no auth
+  workflow_t2v: "/path/to/your/verified_wan22_t2v_api_export.json"
+  # Prefer your own verified API export over the skill's bundled template.
+
+judge:
+  adapter: "ollama"                 # "ollama" | "openai_compat" (llama.cpp llama-server, vLLM)
+  base_url: "http://127.0.0.1:11434"
+  model: "qwen3-vl:8b-instruct"     # 8B-class first; escalate to ~32B only if Phase 0 says so
+  temperature: 0
+  seed: 7
+  num_ctx: 16384                    # 8 images + rubric must fit; doctor probes this
+  timeout_s: 300
+  keep_alive_wave: "10m"            # held during a judge wave; unloaded at wave end
+
+rewrite:
+  enabled: true                     # off_prompt re-roll attempt 2 (one rewrite, logged)
+  model: "qwen3:8b"                 # local TEXT model (no vision needed)
+
+paths:
+  runs_dir: "runs"                  # put on the big disk; doctor checks headroom

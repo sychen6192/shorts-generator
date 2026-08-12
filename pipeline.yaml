@@ -1,0 +1,26 @@
+# Declarative pipeline manifest (docs/plan.md §2.8).
+# v1: interpreted by shortsloop's built-in runner. Later: bound to a workflow engine —
+# stage names below are the migration contract; semantics per stage are documented in
+# docs/plan.md §1 and shortsloop/runner.py.
+pipeline: shortsloop-nightly
+stages: [schedule, claim, generate, verify, persist, complete]
+policies:
+  max_attempts_per_clip: 3          # 1 original + 2 re-rolls (hard rule 5)
+  wall_clock_budget_h: 6
+  disk_min_free_gb: 20
+  waves_max: 3                      # = max_attempts_per_clip
+  comfy:
+    timeout_s: 1800                 # per generation incl. model load
+    poll_s: 5
+    one_job_at_a_time: true         # hard rule 4
+  judge:
+    timeout_s: 300                  # per clip, all frames in one call
+    retries: 1                      # on schema-invalid/timeout, then clip-scope ERROR
+    infra_escalation_after: 2       # consecutive clip-scope L2 errors → infra halt
+  vram_handoff:
+    free_min_gb: 24                 # /system_stats must report at least this after /free
+    wait_timeout_s: 180             # else infra ERROR: halt (hard rule 3)
+resources:
+  comfy_host: ${COMFY_HOST}         # machine-local values resolve via config.yaml/env
+  workflow_t2v: config
+  judge: config
