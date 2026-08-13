@@ -11,14 +11,13 @@ commands:
   check            run the two-layer checker on one clip (alias: shortsloop-check)
   run              nightly wave runner over a dispatch sheet
   report           re-render report.md from a run directory's report.json
-  label            Phase 0 labeling web UI                          [lands in M4]
-  calibrate-batch  generate the draft-res calibration batch         [lands in M4]
-  calibrate-tune   tune thresholds against labels, write report     [lands in M4]
+  label            Phase 0 labeling web UI (keyboard-only, resumable)
+  calibrate-batch  generate the draft-res calibration batch (workstation)
+  calibrate-tune   tune thresholds against labels; --approve = sign-off gate
   doctor           verify the workstation environment               [lands in M5]
 """
 
 _PENDING = {
-    "label": "M4", "calibrate-batch": "M4", "calibrate-tune": "M4",
     "doctor": "M5",
 }
 
@@ -38,6 +37,15 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "report":
         from .report import main_report
         return main_report(rest)
+    if cmd == "label":
+        from .label import main_label
+        return main_label(rest)
+    if cmd == "calibrate-batch":
+        from .calibrate.batchgen import main_batch
+        return main_batch(rest)
+    if cmd == "calibrate-tune":
+        from .calibrate.tune import main_tune
+        return main_tune(rest)
     if cmd in _PENDING:
         print(f"shortsloop {cmd}: not implemented yet — lands in {_PENDING[cmd]} "
               f"(see docs/plan.md §7)", file=sys.stderr)
