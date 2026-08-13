@@ -1,8 +1,10 @@
 # shortsloop v1 — implementation plan
 
-Status: **awaiting user approval**. Once approved, the verdict schema, exit codes,
-failure classes, stage names, and file layouts in this document are **frozen** —
-implementation may not drift from them without coming back here first.
+Status: **approved 2026-08-12 · M1–M5 implemented and CPU-verified (79 tests).**
+The verdict schema, exit codes, failure classes, stage names, and file layouts in
+this document are **frozen** — implementation may not drift from them without
+coming back here first. Next: the workstation phase (`docs/runbook.md`) — doctor,
+Phase 0 calibration (two user gates), first supervised nightly, DoD checklist.
 
 Companion: `docs/brainstorm.md` (discovery record + argued design positions D1–D10).
 

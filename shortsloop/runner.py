@@ -92,8 +92,9 @@ class ClipRun:
 class Runner:
     def __init__(self, *, dispatch_path, config_path, pipeline_path, thresholds_path,
                  runs_dir=None, resume_dir=None, allow_uncalibrated=False,
-                 clock=time.monotonic, disk_free_gb=None, checker_argv=None,
-                 rng=None):
+                 skip_doctor=False, clock=time.monotonic, disk_free_gb=None,
+                 checker_argv=None, rng=None):
+        self.skip_doctor = skip_doctor
         self.dispatch_path = Path(dispatch_path)
         self.config_path = Path(config_path)
         self.pipeline_path = Path(pipeline_path)
@@ -128,6 +129,23 @@ class Runner:
             return self._refuse("config.yaml needs comfy.host and comfy.workflow_t2v")
         if not (self.cfg.get("judge") or {}).get("model"):
             return self._refuse("config.yaml needs judge.model")
+
+        if not self.skip_doctor:
+            doctor_path = self.config_path.parent / "doctor.json"
+            if not doctor_path.is_file():
+                return self._refuse(
+                    f"no doctor snapshot ({doctor_path}) — run `shortsloop doctor` "
+                    f"on this machine first (or --skip-doctor for a supervised run)")
+            try:
+                snap = json.loads(doctor_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return self._refuse(f"doctor snapshot unparseable: {doctor_path}")
+            if not snap.get("ok"):
+                failed = [c["name"] for c in snap.get("checks", [])
+                          if not c.get("ok") and c.get("level") == "FAIL"]
+                return self._refuse(
+                    f"last doctor run FAILED ({', '.join(failed) or 'see doctor.json'})"
+                    f" — fix and re-run `shortsloop doctor`")
 
         pol = json.loads(json.dumps(DEFAULT_POLICIES))  # deep copy
         if self.pipeline_path.is_file():
@@ -720,9 +738,12 @@ def main_run(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume", default=None, metavar="RUN_DIR")
     ap.add_argument("--allow-uncalibrated", action="store_true",
                     help="supervised runs only — the unattended gate stays closed")
+    ap.add_argument("--skip-doctor", action="store_true",
+                    help="skip the doctor.json snapshot gate (supervised runs)")
     args = ap.parse_args(argv)
     runner = Runner(dispatch_path=args.dispatch, config_path=args.config,
                     pipeline_path=args.pipeline, thresholds_path=args.thresholds,
                     runs_dir=args.runs_dir, resume_dir=args.resume,
-                    allow_uncalibrated=args.allow_uncalibrated)
+                    allow_uncalibrated=args.allow_uncalibrated,
+                    skip_doctor=args.skip_doctor)
     return runner.run()

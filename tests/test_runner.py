@@ -86,6 +86,9 @@ def make_env(tmp_path, comfy, judge_url, *, thresholds_over=None, policies_over=
         "rewrite": {"enabled": True, "model": "fake-text-model"},
         "paths": {"runs_dir": str(tmp_path / "runs")},
     }), encoding="utf-8")
+    # a passing doctor snapshot next to the config (the runner's doctor-gate)
+    (tmp_path / "doctor.json").write_text(json.dumps({"ok": True, "checks": []}),
+                                          encoding="utf-8")
     return {"config": config, "pipeline": pipeline, "thresholds": thr,
             "runs": tmp_path / "runs"}
 
@@ -215,6 +218,27 @@ def test_off_prompt_rewrite_once_then_plain_reroll(clips, tmp_path):
 
 
 # ---------------------------------------------------------------- fail-closed
+
+def test_doctor_gate_refuses_without_passing_snapshot(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        doctor_json = tmp_path / "doctor.json"
+
+        doctor_json.unlink()                                # no snapshot at all
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+        assert comfy.submissions == []
+
+        doctor_json.write_text(json.dumps({                 # failed snapshot
+            "ok": False, "checks": [{"name": "judge.vision", "ok": False,
+                                     "level": "FAIL", "detail": "blind"}]}))
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+        assert comfy.submissions == []
+
+        # supervised override works; then a passing snapshot works
+        assert make_runner(small_sheet(tmp_path), env, skip_doctor=True).run() == 0
+        doctor_json.write_text(json.dumps({"ok": True, "checks": []}))
+        assert make_runner(small_sheet(tmp_path), env).run() == 0
+
 
 def test_uncalibrated_thresholds_refuse_unattended(clips, tmp_path):
     with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):

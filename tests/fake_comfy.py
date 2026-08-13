@@ -65,6 +65,9 @@ class _Handler(BaseHTTPRequestHandler):
                         "devices": [{"name": "FakeGPU 5090",
                                      "vram_free": int(srv.vram_free_gb * GB),
                                      "vram_total": 32 * GB}]})
+        elif parsed.path.startswith("/models/"):
+            folder = parsed.path.rsplit("/", 1)[1]
+            self._json(srv.models.get(folder, []))
         elif parsed.path.startswith("/history/"):
             pid = parsed.path.rsplit("/", 1)[1]
             job = srv.jobs.get(pid)
@@ -143,9 +146,11 @@ class _Handler(BaseHTTPRequestHandler):
 class FakeComfy(ThreadingHTTPServer):
     def __init__(self, fixture_paths: dict, scenarios: list[dict] | None = None,
                  vram_free_gb: float = 4.0, vram_after_free_gb: float = 28.0,
-                 never_frees: bool = False, preloaded_jobs: dict | None = None):
+                 never_frees: bool = False, preloaded_jobs: dict | None = None,
+                 models: dict | None = None):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.fixture_paths = {k: str(v) for k, v in fixture_paths.items()}
+        self.models = models or {}
         self.scenarios = list(scenarios or [])
         self.vram_free_gb = vram_free_gb
         self.vram_after_free_gb = vram_after_free_gb

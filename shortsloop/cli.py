@@ -14,12 +14,8 @@ commands:
   label            Phase 0 labeling web UI (keyboard-only, resumable)
   calibrate-batch  generate the draft-res calibration batch (workstation)
   calibrate-tune   tune thresholds against labels; --approve = sign-off gate
-  doctor           verify the workstation environment               [lands in M5]
+  doctor           verify the workstation environment, write doctor.json
 """
-
-_PENDING = {
-    "doctor": "M5",
-}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,10 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "calibrate-tune":
         from .calibrate.tune import main_tune
         return main_tune(rest)
-    if cmd in _PENDING:
-        print(f"shortsloop {cmd}: not implemented yet — lands in {_PENDING[cmd]} "
-              f"(see docs/plan.md §7)", file=sys.stderr)
-        return 2
+    if cmd == "doctor":
+        from .doctor import main_doctor
+        return main_doctor(rest)
     print(f"shortsloop: unknown command {cmd!r}\n\n{USAGE}", file=sys.stderr)
     return 2
 

@@ -81,11 +81,14 @@ class FakeOllama(ThreadingHTTPServer):
         self.rewrite_calls = 0
         self.last_chat_payload = None
         self.last_rewrite_payload = None
+        self.probe_answers: list[str] = []
 
     def handle_error(self, request, client_address):
         pass  # client-side timeouts close sockets mid-write; keep test output clean
 
     def content(self) -> str:
+        if self.probe_answers:
+            return json.dumps({"dominant_color": self.probe_answers.pop(0)})
         if self.scenario == "garbage":
             return "the clip looks fine to me, PASS!"
         if self.scenario == "missing_dim":
