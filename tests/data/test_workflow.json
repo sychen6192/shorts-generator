@@ -1,0 +1,14 @@
+{
+  "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "PLACEHOLDER POSITIVE", "clip": ["10", 0]}, "_meta": {"title": "Positive Prompt"}},
+  "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "色调艳丽,过曝,静态,细节模糊不清", "clip": ["10", 0]}, "_meta": {"title": "Negative Prompt"}},
+  "3": {"class_type": "EmptyHunyuanLatentVideo", "inputs": {"width": 480, "height": 832, "length": 81, "batch_size": 1}},
+  "4": {"class_type": "KSamplerAdvanced", "inputs": {"add_noise": "enable", "noise_seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": 2, "return_with_leftover_noise": "enable", "model": ["11", 0], "positive": ["1", 0], "negative": ["2", 0], "latent_image": ["3", 0]}},
+  "5": {"class_type": "KSamplerAdvanced", "inputs": {"add_noise": "disable", "noise_seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 2, "end_at_step": 10000, "return_with_leftover_noise": "disable", "model": ["12", 0], "positive": ["1", 0], "negative": ["2", 0], "latent_image": ["4", 0]}},
+  "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["13", 0]}},
+  "7": {"class_type": "CreateVideo", "inputs": {"fps": 16, "images": ["6", 0]}},
+  "8": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "video/shortsloop", "format": "mp4", "codec": "h264", "video": ["7", 0]}},
+  "10": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan"}},
+  "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+  "12": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+  "13": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}}
+}

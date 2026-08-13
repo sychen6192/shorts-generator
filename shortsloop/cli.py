@@ -9,16 +9,15 @@ shortsloop <command> [args]
 
 commands:
   check            run the two-layer checker on one clip (alias: shortsloop-check)
-  run              nightly wave runner over a dispatch sheet        [lands in M3]
+  run              nightly wave runner over a dispatch sheet
+  report           re-render report.md from a run directory's report.json
   label            Phase 0 labeling web UI                          [lands in M4]
   calibrate-batch  generate the draft-res calibration batch         [lands in M4]
   calibrate-tune   tune thresholds against labels, write report     [lands in M4]
   doctor           verify the workstation environment               [lands in M5]
-  report           re-render report.md from a run directory         [lands in M3]
 """
 
 _PENDING = {
-    "run": "M3", "report": "M3",
     "label": "M4", "calibrate-batch": "M4", "calibrate-tune": "M4",
     "doctor": "M5",
 }
@@ -33,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "check":
         from .check import main as check_main
         return check_main(rest)
+    if cmd == "run":
+        from .runner import main_run
+        return main_run(rest)
+    if cmd == "report":
+        from .report import main_report
+        return main_report(rest)
     if cmd in _PENDING:
         print(f"shortsloop {cmd}: not implemented yet — lands in {_PENDING[cmd]} "
               f"(see docs/plan.md §7)", file=sys.stderr)

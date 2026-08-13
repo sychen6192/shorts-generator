@@ -58,6 +58,36 @@ def failure_classes(failed_l1_checks: list[str], failed_l2_dims: list[str]) -> l
     return sorted(classes, key=CLASS_PRIORITY.index)
 
 
+def plan_reroll(classes: list[str], next_attempt: int, current_prompt: str) -> dict:
+    """Re-roll plan for the coming attempt (docs/plan.md §2.3 — FROZEN).
+
+    `classes` is priority-ordered (first = primary); `next_attempt` is the 1-based
+    attempt about to run (2 or 3). Motion phrases derive from the clip's CURRENT
+    prompt but do not replace it (per-attempt transform); only the off_prompt
+    rewrite persists a new prompt — the runner handles that distinction.
+    Never touches cfg / shift / the negative prompt (CLAUDE.md).
+    """
+    primary = classes[0] if classes else "broken"
+    plan = {"primary_class": primary, "prompt": current_prompt,
+            "steps": None, "action": "reseed", "wants_rewrite": False}
+    if primary == "static":
+        plan["prompt"] = append_motion_phrase(current_prompt, next_attempt - 2)
+        plan["action"] = "motion_phrase"
+        if next_attempt >= 3:
+            plan["steps"] = 8
+            plan["action"] = "motion_phrase+steps8"
+    elif primary == "flicker":
+        plan["steps"] = 8
+        plan["action"] = "steps8"
+    elif primary == "off_prompt":
+        if next_attempt == 2:
+            plan["wants_rewrite"] = True
+            plan["action"] = "rewrite"
+        else:
+            plan["action"] = "reseed_keep_prompt"
+    return plan
+
+
 def append_motion_phrase(prompt: str, attempt_index: int) -> str:
     """Insert a motion phrase (deterministic pick) before the composition tail."""
     phrase = MOTION_PHRASES[attempt_index % len(MOTION_PHRASES)]

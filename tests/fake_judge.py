@@ -37,7 +37,18 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/api/chat":
+            messages = payload.get("messages") or [{}, {}]
+            is_vision = any("images" in m for m in messages)
+            if not is_vision:                      # text-only = rewrite request
+                self.server.rewrite_calls += 1
+                self.server.last_rewrite_payload = payload
+                self._json({"message": {"role": "assistant",
+                                        "content": json.dumps(
+                                            self.server.rewrite_response)},
+                            "done": True})
+                return
             self.server.chat_calls += 1
+            self.server.chat_times.append(time.monotonic())
             self.server.last_chat_payload = payload
             if self.server.sleep_s:
                 time.sleep(self.server.sleep_s)
@@ -52,16 +63,24 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class FakeOllama(ThreadingHTTPServer):
-    def __init__(self, scenario="good", scores=None,
-                 model="qwen3-vl:8b-instruct", sleep_s=0.0):
+    def __init__(self, scenario="good", scores=None, scores_queue=None,
+                 model="qwen3-vl:8b-instruct", sleep_s=0.0,
+                 rewrite_response=None):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.scenario = scenario
         self.scores = scores
+        self.scores_queue = list(scores_queue or [])
         self.model = model
         self.sleep_s = sleep_s
+        self.rewrite_response = rewrite_response or {
+            "rewritten_prompt": "REWRITTEN: a red cube sliding fast across a dark "
+                                "slate table; slow dolly-in, vertical 9:16 composition"}
         self.chat_calls = 0
+        self.chat_times: list[float] = []
         self.generate_calls = 0
+        self.rewrite_calls = 0
         self.last_chat_payload = None
+        self.last_rewrite_payload = None
 
     def handle_error(self, request, client_address):
         pass  # client-side timeouts close sockets mid-write; keep test output clean
@@ -76,6 +95,8 @@ class FakeOllama(ThreadingHTTPServer):
             scores = {k: dict(v) for k, v in (self.scores or GOOD_SCORES).items()}
             scores["anatomy_artifacts"]["na"] = True  # na not allowed for this dim
             return json.dumps(scores)
+        if self.scores_queue:
+            return json.dumps(self.scores_queue.pop(0))
         return json.dumps(self.scores or GOOD_SCORES)
 
 
