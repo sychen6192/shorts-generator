@@ -10,19 +10,28 @@ patchable at the nightly 720x1280/81f/16fps/steps-8 spec, and its model files ex
 on the server · VRAM handoff (/free, then free VRAM verified via /system_stats) ·
 judge reachable + model installed + a two-call color VISION probe (a text-only
 model that cannot see the images has a 1-in-9 chance of passing) + an L2 DRY RUN:
-the real 8-frame 720x1280 rubric call, strict-JSON parsed, inside judge.timeout_s
-(plan §9: context fit) · judge unload verified (VRAM comes back) · rewrite model on
-ITS server (warn) · disk headroom on the runs_dir filesystem · thresholds/pipeline.
+the real 8-frame 720x1280 rubric call, parsed by the nightly parser, inside the
+nightly's judge timeout (plan §9: context fit) · judge unload: the runner's own
+judge->generation handoff, proven able to tell a resident VLM from an idle card ·
+rewrite model on ITS server (warn) · disk headroom on the runs_dir filesystem ·
+thresholds/pipeline.
+
+Same settings as the nightly (shortsloop/settings.py): pipeline.yaml loaded as the
+runner loads it, and the judge configured exactly as the nightly checker gets it
+(pipeline.yaml's judge timeout_s/retries over config.yaml's). Probe replies are
+parsed with the nightly L2 parser's own unwrapping (l2._load_json).
 
 Fail closed, both ways:
 - "could not verify" is a FAIL wherever the runner depends on the thing (no GPU,
-  unlistable model folders, unrecognized loaders, handoff skipped with --no-free).
+  unlistable model folders, unrecognized loaders, handoff skipped with --no-free,
+  free VRAM never read with the VLM verifiably loaded).
 - doctor.json is overwritten with ok:false ("in progress") BEFORE any check runs,
   and any exception still ends with ok:false on disk — a crashed or interrupted
   doctor never leaves an older green snapshot behind.
 
 Hard rule 3 applies to the doctor's own judge calls: the VLM is loaded only after
-free VRAM was verified, and is unloaded (and VRAM re-verified) right after.
+free VRAM was verified, never when it could not be unloaded again (openai_compat
+without judge.unload_url), and is unloaded (and VRAM re-verified) right after.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ import cv2
 import numpy as np
 import yaml
 
-from . import gpu, l2
+from . import gpu, l2, settings
 from .comfy import ComfyClient
 from .errors import CheckError, InfraError
 from .judge import make_adapter
@@ -74,6 +83,14 @@ L2_PROBE_PROMPT = (
     "continuous motion from the first frame to the last, vertical 9:16 composition")
 
 CRON_DEFAULT_PATH = ("/usr/bin", "/bin")
+
+# Where the operator changes what the NIGHTLY checker uses (plan §2.8, amended):
+# config.yaml's judge.timeout_s/retries only apply to a standalone shortsloop-check.
+NIGHTLY_TIMEOUT = "pipeline.yaml policies.judge.timeout_s"
+NIGHTLY_RETRIES = "pipeline.yaml policies.judge.retries"
+GEN_THRESHOLD = "pipeline.yaml policies.vram_handoff.gen_free_min_gb"
+# A loaded-vs-unloaded gap smaller than this is measurement noise, not a VLM.
+MIN_UNLOAD_GAP_GB = 1.0
 
 # Core ComfyUI loader classes -> (filename input, /models/<folder>).
 LOADERS = {"UNETLoader": ("unet_name", "diffusion_models"),
@@ -149,12 +166,14 @@ class Doctor:
         self.ok = True
         self.tools: dict[str, str] = {}
 
-    def add(self, name: str, ok: bool, detail: str, warn_only: bool = False):
+    def add(self, name: str, ok: bool, detail: str, warn_only: bool = False,
+            **data):
+        """`data`: structured measurements stored with the check in doctor.json."""
         level = "OK" if ok else ("WARN" if warn_only else "FAIL")
         if not ok and not warn_only:
             self.ok = False
         self.checks.append({"name": name, "ok": bool(ok), "level": level,
-                            "detail": detail})
+                            "detail": detail, **data})
         print(f"[doctor] {level:4s} {name}: {detail}")
 
 
@@ -168,9 +187,12 @@ def _guard(doc: Doctor, name: str, fn, *args, default=None):
         return default
 
 
-def _handoff_policy(pol: dict) -> tuple[float, float]:
-    h = pol.get("vram_handoff") or {}
-    return float(h.get("free_min_gb", 24)), float(h.get("wait_timeout_s", 180))
+def _handoff(pol: dict) -> tuple[float, float, float]:
+    """The runner's thresholds: (free_min_gb — generation->judge, gen_free_min_gb —
+    judge->generation via gpu.gen_free_min_gb, wait_timeout_s)."""
+    vh = pol["vram_handoff"]
+    return (float(vh["free_min_gb"]), gpu.gen_free_min_gb(vh),
+            float(vh["wait_timeout_s"]))
 
 
 # ---------------------------------------------------------------- config / policies
@@ -225,32 +247,30 @@ def _load_config(doc: Doctor, cfg_file: Path) -> dict | None:
 
 
 def _load_policies(doc: Doctor, pipe_file: Path) -> dict:
-    """pipeline.yaml policies merged onto the runner's defaults exactly as the
-    runner merges them (so doctor verifies the floors the runner will enforce)."""
-    from .runner import DEFAULT_POLICIES     # lazy: the runner may import doctor
-    pol = json.loads(json.dumps(DEFAULT_POLICIES))
+    """pipeline.yaml exactly as the runner loads it (settings.load_policies), so
+    doctor verifies the floors and judge settings the nightly will use. A file the
+    runner would refuse is a FAIL here; the remaining checks then run on the
+    defaults so the operator still sees everything else."""
     if not pipe_file.is_file():
         doc.add("pipeline", False, f"missing: {pipe_file} — runner defaults apply",
                 warn_only=True)
-        return pol
+        return settings.load_policies(None)
     try:
-        loaded = yaml.safe_load(pipe_file.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
-        doc.add("pipeline", False, f"{pipe_file} unparseable: "
-                                   f"{str(e).strip().splitlines()[0]}")
-        return pol
-    policies = loaded.get("policies") if isinstance(loaded, dict) else None
-    if not isinstance(loaded, dict) or not isinstance(policies or {}, dict):
-        doc.add("pipeline", False, f"{pipe_file}: top level and `policies` must be "
-                                   f"mappings")
-        return pol
-    for key, val in (policies or {}).items():
-        if isinstance(val, dict) and isinstance(pol.get(key), dict):
-            pol[key].update(val)
-        else:
-            pol[key] = val
-    doc.add("pipeline", True, f"{pipe_file} loaded"
-            + ("" if policies else " (no policies — runner defaults apply)"))
+        pol = settings.load_policies(pipe_file)
+        free_min, gen_min, wait = _handoff(pol)
+    except InfraError as e:
+        doc.add("pipeline", False, f"{e.message} — the runner refuses this file")
+        return settings.load_policies(None)
+    except (KeyError, TypeError, ValueError) as e:   # incl. undecodable bytes
+        doc.add("pipeline", False, f"{pipe_file}: unusable policies "
+                                   f"({type(e).__name__}: {e}) — the nightly cannot "
+                                   f"run on it")
+        return settings.load_policies(None)
+    jp = pol["judge"]
+    doc.add("pipeline", True,
+            f"{pipe_file} · nightly judge timeout_s {jp.get('timeout_s')} retries "
+            f"{jp.get('retries')} · vram_handoff free_min_gb {free_min:g}, "
+            f"gen_free_min_gb {gen_min:g}, wait_timeout_s {wait:g}")
     return pol
 
 
@@ -293,7 +313,10 @@ def _check_binaries(doc: Doctor) -> None:
 
 # ---------------------------------------------------------------- ComfyUI
 
-def _check_gpu(doc: Doctor, devices, need_gb: float) -> None:
+def _check_gpu(doc: Doctor, devices, pol: dict) -> None:
+    free_min, gen_min, _wait = _handoff(pol)
+    need_gb, knob = ((gen_min, "vram_handoff.gen_free_min_gb") if gen_min > free_min
+                     else (free_min, "vram_handoff.free_min_gb"))
     if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
         doc.add("comfy.gpu", False, "/system_stats reports no GPU devices — ComfyUI "
                                     "without CUDA cannot generate, and free VRAM "
@@ -309,8 +332,8 @@ def _check_gpu(doc: Doctor, devices, need_gb: float) -> None:
         / 2 ** 30
     if total < need_gb:
         doc.add("comfy.gpu", False, f"{dev.get('name', 'GPU?')}: {total:.1f} GB total "
-                                    f"< vram_handoff.free_min_gb {need_gb:g} — the "
-                                    f"handoff can never pass")
+                                    f"< {knob} {need_gb:g} — the handoff can never "
+                                    f"pass")
         return
     doc.add("comfy.gpu", True, f"{dev.get('name', 'GPU?')} · VRAM {free:.1f}/"
                                f"{total:.1f} GB free")
@@ -387,7 +410,7 @@ def _check_comfy(doc: Doctor, cfg: dict, pol: dict) -> ComfyClient | None:
     stats = stats if isinstance(stats, dict) else {}
     doc.add("comfy.server", True,
             f"{host} · comfyui {(stats.get('system') or {}).get('comfyui_version', '?')}")
-    _check_gpu(doc, stats.get("devices"), _handoff_policy(pol)[0])
+    _check_gpu(doc, stats.get("devices"), pol)
     try:
         q = client.queue_state()
         depth = len(q["running"]) + len(q["pending"])
@@ -428,7 +451,7 @@ def _handoff_to_judge(doc: Doctor, client: ComfyClient | None, pol: dict,
                       do_free: bool) -> bool:
     """Records vram.handoff. Returns True only when free VRAM for the judge has
     been VERIFIED — the precondition for loading the VLM at all (hard rule 3)."""
-    need, wait = _handoff_policy(pol)
+    need, _gen_min, wait = _handoff(pol)
     if client is None:
         doc.add("vram.handoff", False, "not verified: ComfyUI not reachable/configured "
                                        "— the judge probes will not load the VLM "
@@ -465,38 +488,55 @@ def _handoff_to_judge(doc: Doctor, client: ComfyClient | None, pol: dict,
 
 # ---------------------------------------------------------------- judge
 
-def _probe_vision(doc: Doctor, adapter, judge_cfg: dict) -> None:
-    """Two calls, one solid image each: answers must track the actual colors."""
-    answers = []
-    try:
-        t0 = time.monotonic()
-        for color_name, bgr in (("red", (0, 0, 255)), ("blue", (255, 0, 0))):
+def _probe_vision(doc: Doctor, adapter, judge_cfg: dict) -> bool:
+    """Two calls, one solid image each: answers must track the actual colors.
+    Replies are parsed with the nightly L2 parser's own unwrapping (l2._load_json:
+    one complete <think>…</think> block and one ``` fence, nothing else), so doctor
+    accepts exactly the replies the nightly accepts. Returns True once the judge
+    has answered (the VLM was loaded)."""
+    timeout_s = float(judge_cfg["timeout_s"])
+    answers, answered = [], False
+    t0 = time.monotonic()
+    for color_name, bgr in (("red", (0, 0, 255)), ("blue", (255, 0, 0))):
+        try:
             raw = adapter.judge([_solid_jpeg(bgr)], PROBE_SYSTEM, PROBE_USER,
-                                PROBE_SCHEMA, timeout_s=float(
-                                    judge_cfg.get("timeout_s", 300)))
-            data = json.loads(raw)
-            answers.append((color_name, data.get("dominant_color")
-                            if isinstance(data, dict) else None))
-        elapsed = time.monotonic() - t0
-    except (CheckError, RetryableJudgeError, json.JSONDecodeError) as e:
-        doc.add("judge.vision", False,
-                f"vision/strict-JSON probe failed: {e} — if Ollama's vision sidecar "
-                f"is broken for this model family, switch judge.adapter to "
-                f"openai_compat (llama.cpp llama-server with GGUF+mmproj)")
-        return
+                                PROBE_SCHEMA, timeout_s=timeout_s)
+        except (CheckError, RetryableJudgeError) as e:
+            doc.add("judge.vision", False,
+                    f"vision probe call failed: {e} — if Ollama's vision sidecar is "
+                    f"broken for this model family, switch judge.adapter to "
+                    f"openai_compat (llama.cpp llama-server with GGUF+mmproj, plus "
+                    f"judge.unload_url)")
+            return answered
+        answered = True
+        try:
+            data = l2._load_json(raw)
+        except RetryableJudgeError as e:
+            doc.add("judge.vision", False,
+                    f"probe reply rejected by the nightly L2 parser ({e}); it accepts "
+                    f"a JSON object wrapped in at most one <think>…</think> block "
+                    f"and one ``` fence — reply: {str(raw)[:200]!r}")
+            return answered
+        answers.append((color_name, data.get("dominant_color")
+                        if isinstance(data, dict) else None))
+    elapsed = time.monotonic() - t0
     correct = all(want == got for want, got in answers)
     doc.add("judge.vision", correct,
             f"probe answers {answers} in {elapsed:.1f}s"
             + ("" if correct else " — model did NOT see the images (text-only "
                "fallback?). Do not trust this judge; switch adapters."))
+    return answered
 
 
-def _probe_l2(doc: Doctor, judge_cfg: dict) -> None:
+def _probe_l2(doc: Doctor, judge_cfg: dict) -> bool:
     """The REAL nightly judge call (l2.run_l2: 8 native-resolution frames + the
-    rubric + the strict response schema), on a synthetic 720x1280 clip. Proves the
-    payload fits num_ctx, the model build handles 8 images, and it answers in time.
-    Scores are irrelevant (hard rule 1: doctor judges the instrument, not a clip)."""
-    timeout_s = float(judge_cfg.get("timeout_s", 300))
+    rubric + the strict response schema), on a synthetic 720x1280 clip, with the
+    nightly checker's own timeout/retries (pipeline.yaml). Proves the payload fits
+    num_ctx, the model build handles 8 images, and it answers in time. Scores are
+    irrelevant (hard rule 1: doctor judges the instrument, not a clip). Returns True
+    when the judge answered (the VLM was loaded)."""
+    timeout_s = float(judge_cfg["timeout_s"])
+    nightly = f"{NIGHTLY_TIMEOUT} {timeout_s:g}, retries {judge_cfg.get('retries')}"
     w, h, fps = NIGHTLY["width"], NIGHTLY["height"], NIGHTLY["fps"]
     floors = {d: L2_PROBE_FLOOR for d in l2.DIMENSIONS}
     with tempfile.TemporaryDirectory(prefix="shortsloop-doctor-") as td:
@@ -504,7 +544,7 @@ def _probe_l2(doc: Doctor, judge_cfg: dict) -> None:
             clip = _synthetic_clip(Path(td) / "l2_probe.mp4", w, h, fps)
         except (RuntimeError, OSError, cv2.error) as e:
             doc.add("judge.l2_dryrun", False, f"could not synthesize the probe clip: {e}")
-            return
+            return False
         t0 = time.monotonic()
         try:
             block, _raw = l2.run_l2(clip, {"fps": fps}, L2_PROBE_PROMPT, judge_cfg,
@@ -512,54 +552,107 @@ def _probe_l2(doc: Doctor, judge_cfg: dict) -> None:
         except (CheckError, RetryableJudgeError) as e:
             doc.add("judge.l2_dryrun", False,
                     f"real {l2.N_FRAMES}-frame {w}x{h} rubric call failed after "
-                    f"{time.monotonic() - t0:.1f}s: {e} — check judge.num_ctx (8 "
-                    f"images + rubric must fit), judge.timeout_s, and multi-image "
-                    f"support of this model build")
-            return
+                    f"{time.monotonic() - t0:.1f}s ({nightly}): {e} — check "
+                    f"judge.num_ctx (8 images + rubric must fit), {NIGHTLY_TIMEOUT} / "
+                    f"{NIGHTLY_RETRIES} (what the nightly checker uses), and "
+                    f"multi-image support of this model build")
+            return getattr(e, "raw", None) is not None
         elapsed = time.monotonic() - t0
     n = len(block["frames"])
     in_time = elapsed <= timeout_s
     doc.add("judge.l2_dryrun", n == l2.N_FRAMES and in_time,
-            f"{n} frames {w}x{h} + rubric -> strict-JSON scores parsed in "
-            f"{elapsed:.1f}s (judge.timeout_s {timeout_s:g})"
-            + ("" if in_time else " — slower than timeout_s (a call timed out and "
-               "was retried): the nightly judge wave would ERROR")
+            f"{n} frames {w}x{h} + rubric -> scores parsed by the nightly parser in "
+            f"{elapsed:.1f}s ({nightly})"
+            + ("" if in_time else " — slower than the nightly timeout (a call timed "
+               "out and was retried): the nightly judge wave would ERROR")
             + ("" if n == l2.N_FRAMES else f" — expected {l2.N_FRAMES} frames"))
     if in_time and elapsed > timeout_s / 2:
         doc.add("judge.latency", False,
-                f"one rubric call took {elapsed:.0f}s, over half of judge.timeout_s "
-                f"({timeout_s:g}s) — expect clip-scope ERRORs under load; raise "
-                f"judge.timeout_s", warn_only=True)
+                f"one rubric call took {elapsed:.0f}s, over half of the nightly "
+                f"judge timeout ({timeout_s:g}s) — expect clip-scope ERRORs under "
+                f"load; raise {NIGHTLY_TIMEOUT} (config.yaml's judge.timeout_s only "
+                f"applies to a standalone shortsloop-check)", warn_only=True)
+    return True
 
 
 def _release_judge(doc: Doctor, cfg: dict, judge_cfg: dict, pol: dict,
-                   client: ComfyClient) -> None:
-    """After the doctor's judge wave: unload the VLM (and the rewrite LLM) and
-    VERIFY the VRAM comes back — the nightly judge->generation handoff depends on
-    it (hard rule 3), and an unload that does nothing (e.g. openai_compat without
-    judge.unload_url) must fail here at 22:00, not halt the night."""
-    notes = gpu.unload_llms(judge_cfg, effective_rewrite_cfg(cfg))
-    need, wait = _handoff_policy(pol)
+                   client: ComfyClient, answered: bool, do_free: bool) -> None:
+    """After the doctor's judge wave: the nightly's own judge->generation handoff
+    (gpu.to_generation: unload VLM + rewrite LLM, /free, verify free VRAM against
+    gpu.gen_free_min_gb), plus proof that this threshold DISCRIMINATES — free VRAM
+    read while the VLM is still loaded must be BELOW it, or the runner's check could
+    not tell a judge that failed to unload from an idle card (hard rule 3 would
+    rest on luck). Both readings go into doctor.json, with a threshold between them
+    when the current one does not separate them."""
+    _free_min, gen_min, wait = _handoff(pol)
+    loaded = unloaded = None
+    problems: list[str] = []
     try:
-        free = client.vram_wait(need, wait, "generation")
+        loaded = client.vram_free_gb()          # the VLM is still resident here
     except InfraError as e:
+        problems.append(f"could not read free VRAM with the VLM loaded: {e.message}")
+    rewrite_cfg = effective_rewrite_cfg(cfg)
+    notes: list[str] = []
+    try:
+        if do_free:
+            unloaded, notes = gpu.to_generation(client, judge_cfg, rewrite_cfg,
+                                                gen_min, wait)
+        else:   # --no-free (debugging; the snapshot fails anyway): no /free
+            notes = gpu.unload_llms(judge_cfg, rewrite_cfg)
+            unloaded = client.vram_wait(gen_min, wait, "generation")
+    except InfraError as e:
+        problems.append(f"judge->generation handoff failed: {e.message} — the "
+                        f"nightly would halt before its first Wan wave")
+        try:
+            unloaded = client.vram_free_gb()
+        except InfraError:
+            pass
+
+    readings = (f"VLM loaded: {'?' if loaded is None else f'{loaded:.1f}'} GB free · "
+                f"after unload: {'?' if unloaded is None else f'{unloaded:.1f}'} GB "
+                f"free · judge->generation threshold (gpu.gen_free_min_gb) "
+                f"{gen_min:g} GB")
+    if not answered:
+        problems.append("loaded-vs-idle comparison not verified: the judge never "
+                        "answered, so the VLM may not have been in VRAM when it was "
+                        "measured")
+    elif loaded is not None and loaded >= gen_min:
+        why = (f"with the VLM still loaded {loaded:.1f} GB is already free, which "
+               f"clears the judge->generation threshold {gen_min:g} GB — the runner "
+               f"could not detect a judge that failed to unload, and Wan would load "
+               f"beside it (hard rule 3)")
+        if unloaded is not None and unloaded - loaded >= MIN_UNLOAD_GAP_GB:
+            rec = round((loaded + unloaded) / 2, 1)
+            why += (f"; set {GEN_THRESHOLD}: {rec:g} (between {loaded:.1f} loaded "
+                    f"and {unloaded:.1f} unloaded)")
+        else:
+            why += ("; the unload freed too little VRAM for any threshold to tell "
+                    "the two apart — fix the judge unload first")
+        problems.append(why)
+    vram = {"loaded_free_gb": None if loaded is None else round(loaded, 1),
+            "unloaded_free_gb": None if unloaded is None else round(unloaded, 1),
+            "gen_free_min_gb": gen_min}
+    unload_notes = "; ".join(notes) or "unload requested"
+    if problems:
         doc.add("judge.unload", False,
-                f"{e.message} — the judge did not leave VRAM after unload "
-                f"({'; '.join(notes) or 'no unload notes'}); the nightly "
-                f"judge->generation handoff would halt. openai_compat: set "
-                f"judge.unload_url")
+                f"{' | '.join(problems)} [{readings}; {unload_notes}]", vram=vram)
         return
-    doc.add("judge.unload", True, f"{'; '.join(notes) or 'unload requested'} · "
-                                  f"{free:.1f} GB free again (need {need:g})")
+    doc.add("judge.unload", True,
+            f"{unload_notes} · {readings} — a judge left resident halts the night "
+            f"instead of sharing VRAM with Wan", vram=vram)
 
 
 def _check_judge(doc: Doctor, cfg: dict, pol: dict, client: ComfyClient | None,
-                 vram_ready: bool) -> None:
-    judge_cfg = cfg.get("judge")
-    if not isinstance(judge_cfg, dict) or not judge_cfg.get("model"):
+                 vram_ready: bool, do_free: bool) -> None:
+    if not isinstance(cfg.get("judge"), dict) or not cfg["judge"].get("model"):
         doc.add("judge.config", False, "config needs judge.model")
         return
-    judge_cfg = dict(judge_cfg)      # verbatim: what shortsloop-check will use
+    # exactly what the nightly checker gets (runs/<id>/config.snapshot.yaml):
+    # config.yaml's judge section with pipeline.yaml's timeout_s / retries
+    judge_cfg = settings.effective_judge_cfg(cfg, pol)
+    unload_problem = settings.judge_unload_problem(judge_cfg)
+    if unload_problem:
+        doc.add("judge.unload", False, unload_problem)
     try:
         adapter = make_adapter(judge_cfg)
         digest = adapter.model_digest()
@@ -568,17 +661,23 @@ def _check_judge(doc: Doctor, cfg: dict, pol: dict, client: ComfyClient | None,
     except (CheckError, RetryableJudgeError) as e:
         doc.add("judge.model", False, str(e))
         return
-    if not vram_ready or client is None:
+    why = None
+    if unload_problem:
+        why = ("not run: this judge could not be unloaded afterwards (see "
+               "judge.unload) — hard rule 3: never load a VLM that cannot be evicted")
+    elif not vram_ready or client is None:
         why = ("not run: free VRAM for the judge was not verified (see vram.handoff) "
                "— hard rule 3 forbids loading the VLM beside Wan")
+    if why:
         doc.add("judge.vision", False, why)
         doc.add("judge.l2_dryrun", False, why)
         return
+    answered = False
     try:
-        _probe_vision(doc, adapter, judge_cfg)
-        _probe_l2(doc, judge_cfg)
+        answered = _probe_vision(doc, adapter, judge_cfg)
+        answered = _probe_l2(doc, judge_cfg) or answered
     finally:
-        _release_judge(doc, cfg, judge_cfg, pol, client)
+        _release_judge(doc, cfg, judge_cfg, pol, client, answered, do_free)
 
 
 def _ollama_name(name: str) -> str:
@@ -673,7 +772,7 @@ def _run_checks(doc: Doctor, cfg_file: Path, pipe_file: Path, thr_file: Path,
         client = _guard(doc, "comfy", _check_comfy, doc, cfg, pol)
         ready = _guard(doc, "vram.handoff", _handoff_to_judge, doc, client, pol,
                        do_free, default=False)
-        _guard(doc, "judge", _check_judge, doc, cfg, pol, client, ready)
+        _guard(doc, "judge", _check_judge, doc, cfg, pol, client, ready, do_free)
         _guard(doc, "rewrite", _check_rewrite, doc, cfg)
     _guard(doc, "disk", _check_disk, doc, cfg or {}, pol)
     _guard(doc, "thresholds", _check_thresholds, doc, thr_file)

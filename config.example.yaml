@@ -16,12 +16,17 @@ judge:
   seed: 7
   num_ctx: 16384                    # 8 images + rubric must fit; doctor's L2 dry run sends
                                     # the real 8-frame 720x1280 rubric call to prove it
-  timeout_s: 300                    # per judge call (what shortsloop-check uses); the
-                                    # doctor's L2 dry run must answer inside it
+  timeout_s: 300                    # per judge call for a STANDALONE `shortsloop-check`
+                                    # only. The nightly run (and doctor's L2 dry run)
+                                    # use pipeline.yaml policies.judge.timeout_s/retries
   keep_alive_wave: "10m"            # held during a judge wave; unloaded at wave end
-  # unload_url: "http://127.0.0.1:8080/unload"   # openai_compat only: GET drops the VLM
-  #                                 # from VRAM (hard rule 3). Doctor unloads after its
-  #                                 # probes and FAILs if VRAM does not come back.
+  # unload_url: "http://127.0.0.1:8080/unload"   # REQUIRED for openai_compat: GET drops
+  #                                 # the VLM from VRAM (hard rule 3); without it the
+  #                                 # runner refuses and doctor FAILs judge.unload.
+  #                                 # Doctor reads free VRAM with the VLM loaded and
+  #                                 # again after unload + /free: FAIL unless the
+  #                                 # judge->generation threshold (pipeline.yaml
+  #                                 # vram_handoff.gen_free_min_gb) lies between them.
 
 rewrite:
   enabled: true                     # off_prompt re-roll attempt 2 (one rewrite, logged)
