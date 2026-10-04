@@ -36,9 +36,11 @@ def test_slate_mix_and_determinism():
 def _batch_config(tmp_path, comfy_host) -> Path:
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump({
-        "comfy": {"host": comfy_host, "workflow_t2v": str(DATA / "test_workflow.json"),
-                  "timeout_s": 60},
+        "comfy": {"host": comfy_host, "workflow_t2v": str(DATA / "test_workflow.json")},
     }), encoding="utf-8")
+    (tmp_path / "pipeline.yaml").write_text(yaml.safe_dump({"policies": {
+        "comfy": {"timeout_s": 60, "poll_s": 1},
+        "vram_handoff": {"free_min_gb": 20, "wait_timeout_s": 5}}}), encoding="utf-8")
     return cfg
 
 
@@ -47,7 +49,9 @@ def test_batch_generates_manifest_and_swaps(clips, tmp_path):
     with serve_comfy(fixture_paths=clips) as comfy:
         cfg = _batch_config(tmp_path, comfy.host)
         out = tmp_path / "calibration"
-        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(7)) == 0
+        pipe = str(tmp_path / "pipeline.yaml")
+        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(7),
+                         pipeline_path=pipe) == 0
         rows = _read_jsonl(out / "batch_manifest.jsonl")
         gen = [r for r in rows if r["kind"] != "swap"]
         swaps = [r for r in rows if r["kind"] == "swap"]
@@ -63,7 +67,8 @@ def test_batch_generates_manifest_and_swaps(clips, tmp_path):
         subs_before = len(comfy.submissions)
 
         # resume: nothing regenerated, manifest unchanged
-        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(8)) == 0
+        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(8),
+                         pipeline_path=pipe) == 0
         assert len(comfy.submissions) == subs_before
         assert len(_read_jsonl(out / "batch_manifest.jsonl")) == 9
 
@@ -167,19 +172,10 @@ def test_label_server_rejects_bad_payloads(clips, tmp_path):
 # ------------------------------------------------------------------ tuner
 
 def _mk_cal(tmp_path, rows, labels):
-    cal = tmp_path / "cal"
-    cal.mkdir()
-    with open(cal / "batch_manifest.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-    with open(cal / "metrics.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps({"clip_id": r["clip_id"], "metrics": r["_m"]}) + "\n")
-    with open(cal / "labels.jsonl", "w") as f:
-        for cid, (verdict, classes) in labels.items():
-            f.write(json.dumps({"clip_id": cid, "verdict": verdict,
-                                "classes": classes, "ts": 1}) + "\n")
-    return cal
+    """Real (tiny) clip files, metrics cached under each clip's sha, labels that
+    carry the labeled clip's sha — the tuner only trusts labels it can verify."""
+    from test_calibrate_tune import mk_cal
+    return mk_cal(tmp_path, rows, labels)
 
 
 BASE_M = {"flow_mag_median": 0.003, "flow_mag_p90": 0.004, "ssim_min": 0.7,
