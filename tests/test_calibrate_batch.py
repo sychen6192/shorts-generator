@@ -12,7 +12,8 @@ import yaml
 from fake_comfy import serve_comfy
 from fake_judge import serve as serve_judge
 
-from shortsloop.calibrate.batchgen import N_SWAPS, plan_swaps, run_batch
+from shortsloop import lock
+from shortsloop.calibrate.batchgen import N_SWAPS, main_batch, plan_swaps, run_batch
 from shortsloop.calibrate.prompts import GOOD, build_slate
 from shortsloop.comfy import ComfyClient
 from shortsloop.state import _read_jsonl
@@ -21,14 +22,17 @@ DATA = Path(__file__).parent / "data"
 
 
 def _env(tmp_path, comfy_host, judge_url=None, *, timeout_s=60, free_min_gb=20,
-         wait_timeout_s=2):
+         wait_timeout_s=2, judge=None):
     cfg = {"comfy": {"host": comfy_host,
-                     "workflow_t2v": str(DATA / "test_workflow.json")}}
+                     "workflow_t2v": str(DATA / "test_workflow.json")},
+           "paths": {"runs_dir": str(tmp_path / "runs")}}   # the run lock lives here
     if judge_url:
         cfg["judge"] = {"adapter": "ollama", "base_url": judge_url,
                         "model": "qwen3-vl:8b-instruct"}
         cfg["rewrite"] = {"enabled": True, "model": "fake-text-model",
                           "base_url": judge_url}
+    if judge is not None:
+        cfg["judge"] = judge
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     pipeline = tmp_path / "pipeline.yaml"
@@ -129,3 +133,61 @@ def test_ctrl_c_stops_the_in_flight_job_and_rerun_is_clean(clips, tmp_path):
         assert comfy.violations == 0 and len(comfy.submissions) == 2
         assert [r["clip_id"] for r in _read_jsonl(out / "batch_manifest.jsonl")] \
             == ["cal001"]
+
+
+# ------------------------------- [review fix-calib-2] run lock, judge unload, policies
+
+def test_batch_refuses_while_another_process_holds_the_run_lock(clips, tmp_path, capsys):
+    """[integration-seams#7] calibrate-batch uses the GPU: it takes the same
+    runs_dir/.shortsloop.lock as the nightly runner, and refuses (exit 2) with zero
+    GPU contact while another process holds it."""
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (judge, jurl):
+        config, pipeline = _env(tmp_path, comfy.host, jurl)
+        held = lock.acquire(tmp_path / "runs")          # e.g. the nightly runner
+        try:
+            capsys.readouterr()
+            assert run_batch(str(config), str(tmp_path / "cal"), count=1,
+                             rng=random.Random(1), pipeline_path=str(pipeline)) == 2
+            assert "lock" in capsys.readouterr().out
+            assert comfy.submissions == [] and comfy.free_calls == 0
+            assert judge.generate_calls == 0            # not even an unload
+        finally:
+            lock.release(held)
+        assert run_batch(str(config), str(tmp_path / "cal"), count=1,
+                         rng=random.Random(1), pipeline_path=str(pipeline)) == 0
+        assert len(comfy.submissions) == 1
+    lock.release(lock.acquire(tmp_path / "runs"))       # released after the run
+
+
+def test_batch_refuses_a_judge_it_could_not_unload(clips, tmp_path, capsys):
+    """[finding 7] openai_compat without judge.unload_url: the VLM could not be
+    evicted before Wan loads (hard rule 3) — refuse before touching the GPU."""
+    with serve_comfy(fixture_paths=clips) as comfy:
+        judge = {"adapter": "openai_compat", "base_url": "http://127.0.0.1:9",
+                 "model": "qwen3-vl-8b"}
+        config, pipeline = _env(tmp_path, comfy.host, judge=judge)
+        capsys.readouterr()
+        assert run_batch(str(config), str(tmp_path / "cal"), count=1,
+                         rng=random.Random(1), pipeline_path=str(pipeline)) == 2
+        assert "unload_url" in capsys.readouterr().out
+        assert comfy.submissions == [] and comfy.free_calls == 0
+
+        with serve_judge() as (_srv, jurl):            # an unload hook: proceeds
+            judge["unload_url"] = jurl + "/unload"
+            config, pipeline = _env(tmp_path, comfy.host, judge=judge)
+            assert run_batch(str(config), str(tmp_path / "cal"), count=1,
+                             rng=random.Random(1), pipeline_path=str(pipeline)) == 0
+        assert len(comfy.submissions) == 1
+
+
+def test_batch_refuses_malformed_pipeline_policies(clips, tmp_path, capsys):
+    """Shared settings.load_policies: a malformed pipeline.yaml is a refusal, never
+    a traceback, and never a silently default-policy GPU run."""
+    with serve_comfy(fixture_paths=clips) as comfy:
+        config, pipeline = _env(tmp_path, comfy.host)
+        pipeline.write_text("policies: oops\n", encoding="utf-8")
+        capsys.readouterr()
+        assert main_batch(["--config", str(config), "--pipeline", str(pipeline),
+                           "--out", str(tmp_path / "cal"), "--count", "1"]) == 2
+        assert "policies" in capsys.readouterr().out
+        assert comfy.submissions == [] and comfy.free_calls == 0

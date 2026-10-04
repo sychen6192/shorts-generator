@@ -479,7 +479,7 @@ def test_metrics_cache_is_keyed_by_clip_bytes(tmp_path, clips):
 
 # --------------------------------------------------------- [98] --approve gate
 
-def test_approve_refuses_null_labels_sha_when_labels_file_is_gone(tmp_path):
+def test_approve_refuses_null_labels_sha_when_labels_file_is_gone(tmp_path, capsys):
     rows, labels = base_rows_and_labels()
     cal = mk_cal(tmp_path, rows, labels)
     assert run_tune(str(cal)) == 0
@@ -489,13 +489,16 @@ def test_approve_refuses_null_labels_sha_when_labels_file_is_gone(tmp_path):
     p.write_text(yaml.safe_dump(data, sort_keys=False))
     (cal / "labels.jsonl").unlink()
     target = tmp_path / "thresholds.yaml"
-    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    capsys.readouterr()
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 2
+    assert "labels.jsonl is missing" in capsys.readouterr().out
     assert not target.exists()
 
 
 def test_same_day_approvals_get_increasing_versions(tmp_path):
-    rows, labels = base_rows_and_labels()
-    cal = mk_cal(tmp_path, rows, labels)
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
     target = tmp_path / "thresholds.yaml"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     versions = []
@@ -514,7 +517,7 @@ def test_approve_refuses_when_judge_scores_changed_after_tuning(tmp_path):
     assert run_tune(str(cal), approve=True, target=str(tmp_path / "t.yaml")) == 2
 
 
-def test_approve_refuses_hand_edited_values(tmp_path):
+def test_approve_refuses_hand_edited_values(tmp_path, capsys):
     rows, labels = base_rows_and_labels()
     cal = mk_cal(tmp_path, rows, labels)
     assert run_tune(str(cal)) == 0
@@ -523,7 +526,10 @@ def test_approve_refuses_hand_edited_values(tmp_path):
     data["l1"]["motion"]["value"] = 0.0                 # valid shape, untested value
     p.write_text(yaml.safe_dump(data, sort_keys=False))
     assert validate_thresholds({**data, "calibrated": True}) == []
-    assert run_tune(str(cal), approve=True, target=str(tmp_path / "t.yaml")) == 2
+    capsys.readouterr()
+    assert run_tune(str(cal), approve=True, target=str(tmp_path / "t.yaml"),
+                    accept_untested_l2=True) == 2
+    assert "edited after tuning" in capsys.readouterr().out
 
 
 # ------------------------------------------------ [84] judge identity / escalation
@@ -558,3 +564,213 @@ def test_approve_refuses_when_config_names_another_judge(tmp_path):
                                              "model": "qwen3-vl:8b-instruct"}}))
     assert run_tune(str(cal), approve=True, target=str(target),
                     config_path=str(cfg)) == 0
+
+
+# ------------------- [review fix-calib-2] L2 floor search when nothing fits the cap
+
+def _tune_pass_ids(labels):
+    tune_ids, _ = tune_test_ids(labels)
+    return [c for c in tune_ids if labels[c][0] == "pass"]
+
+
+def _assert_l2_fallback_is_loud(cal, forced, capsys):
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "fallback" in out.lower()
+    prop = proposal(cal)
+    marker = prop["provenance"]["l2_floors_fallback"]
+    assert isinstance(marker, str) and marker
+    assert all(c in marker for c in forced)
+    rep = report_json(cal)
+    assert sorted(rep["l2"]["forced_false_fail_ids"]) == sorted(forced)
+    # least-bad: the floors add no false-fail beyond the clips the judge forces
+    assert rep["l2"]["false_fail_on_tune"] == len(forced)
+    assert rep["tune"]["false_fail"] == len(forced)
+    md = (cal / "tuning_report.md").read_text()
+    assert "FALLBACK" in md and all(c in md for c in forced)
+    assert validate_thresholds({**prop, "calibrated": True}) == []
+
+
+def test_l2_floor_search_falls_back_when_the_judge_fails_publishable_clips(tmp_path,
+                                                                           capsys):
+    """[agent-diffs#2] An 8B judge scores imaging_quality=1 on more labeled-pass tune
+    clips than the false-fail cap allows: no floor combination fits (the loosest
+    floor is 2). The tuner must not crash — explicit least-bad fallback, said
+    loudly in stdout, report and provenance."""
+    rows, labels, l2 = _l2_fixture()
+    good = _tune_pass_ids(labels)
+    forced = good[:tune._ff_cap(len(good)) + 1]
+    for c in forced:
+        l2[c] = scores(imaging_quality=1)
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    _assert_l2_fallback_is_loud(cal, forced, capsys)
+    # the deformed clips are still caught where possible (no avoidable miss)
+    assert proposal(cal)["l2"]["floors"]["subject_consistency"] >= 3
+
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target)) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "fallback" in out.lower()
+    approved = yaml.safe_load(target.read_text())
+    assert approved["provenance"]["l2_floors_fallback"]       # marker survives sign-off
+
+
+def test_l2_floor_search_falls_back_on_all_na_publishable_clips(tmp_path, capsys):
+    """[integration-seams#3] A labeled-pass clip with every dimension N/A fails
+    under every floor combination (runtime rule) — same no-crash fallback."""
+    rows, labels, l2 = _l2_fixture()
+    good = _tune_pass_ids(labels)
+    forced = good[:tune._ff_cap(len(good)) + 1]
+    for c in forced:
+        l2[c] = {"dims": {d: 4 for d in DIMS}, "na": {d: True for d in DIMS}}
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    _assert_l2_fallback_is_loud(cal, forced, capsys)
+
+
+def test_tune_l2_direct_with_a_zero_cap_never_raises():
+    """4 labeled-pass clips (cap 0), one scored 1: the reviewer's direct repro."""
+    labels, rows = {}, {}
+    for i in range(4):
+        labels[f"g{i}"] = {"verdict": "pass", "classes": []}
+        rows[f"g{i}"] = {"dimensions": {d: 5 for d in DIMS}, "na": {}}
+    rows["g0"]["dimensions"]["anatomy_artifacts"] = 1
+    for i in range(3):
+        labels[f"b{i}"] = {"verdict": "fail", "classes": ["deformed"]}
+        rows[f"b{i}"] = {"dimensions": {d: 5 for d in DIMS} | {"subject_consistency": 2},
+                         "na": {}}
+    floors, notes = tune.tune_l2(sorted(labels), labels, rows)
+    assert notes["forced_false_fail_ids"] == ["g0"]
+    assert notes["fallback"] and "g0" in notes["fallback"]
+    assert notes["false_fail_on_tune"] == 1 and notes["missed_on_tune"] == 0
+    assert floors["subject_consistency"] >= 3
+
+
+def test_l2_floor_search_without_forced_false_fails_has_no_fallback(tmp_path):
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    assert proposal(cal)["provenance"]["l2_floors_fallback"] is None
+    assert "FALLBACK" not in (cal / "tuning_report.md").read_text()
+
+
+# --------------- [review fix-calib-2] --approve: L1-only proposals fail closed
+
+def test_approve_refuses_an_l1_only_proposal_without_the_explicit_exception(tmp_path,
+                                                                            capsys):
+    """[agent-diffs#1 / docs-cli-truth#4] No judge scores behind the proposal: the
+    L2 floors are untuned defaults — an uncalibrated judge is an uncalibrated
+    instrument. Refused unless --accept-untested-l2, which leaves a loud marker."""
+    rows, labels = base_rows_and_labels()
+    cal = mk_cal(tmp_path, rows, labels)
+    assert run_tune(str(cal)) == 0
+    capsys.readouterr()
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    assert not target.exists()
+    assert "--accept-untested-l2" in capsys.readouterr().out
+
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 0
+    assert "WARNING" in capsys.readouterr().out
+    prov = yaml.safe_load(target.read_text())["provenance"]
+    assert prov["test_scope"].startswith("L1 only")          # stays L1-only
+    assert prov["l2_untested_accepted"] is True
+    assert prov["judge"] is None
+
+
+def test_approve_cli_needs_the_flag_for_the_32b_swap_without_rescoring(tmp_path):
+    """The reviewer's scenario: 8B scores on disk, config switched to a 32B judge,
+    `calibrate-tune` re-run WITHOUT --with-l2 (silently L1-only), then --approve.
+    Must exit non-zero and write no thresholds.yaml."""
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)            # 8B scores on disk
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump({"judge": {"adapter": "ollama",
+                                             "model": "qwen3-vl:32b"}}))
+    target = tmp_path / "thresholds.yaml"
+    base = ["--calibration", str(cal), "--config", str(cfg), "--target", str(target)]
+    assert tune.main_tune(base) == 0
+    assert proposal(cal)["provenance"]["judge"] is None
+    assert tune.main_tune(base + ["--approve"]) == 2
+    assert not target.exists()
+    # the flag is a sign-off modifier only
+    assert tune.main_tune(base + ["--accept-untested-l2"]) == 2
+    assert tune.main_tune(base + ["--approve", "--accept-untested-l2"]) == 0
+    assert yaml.safe_load(target.read_text())["provenance"]["l2_untested_accepted"]
+
+
+def test_judge_backed_approval_carries_no_untested_marker(tmp_path):
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 0               # flag is moot here
+    prov = yaml.safe_load(target.read_text())["provenance"]
+    assert "l2_untested_accepted" not in prov and prov["judge"]["model"] == JUDGE
+
+
+# ------------------ [review fix-calib-2] --approve: L1 metric code fingerprint
+
+def test_approve_refuses_when_l1_metric_code_changed_since_tuning(tmp_path, monkeypatch,
+                                                                  capsys):
+    """[agent-diffs#5] Thresholds are values of the metrics l1.py computes: an l1.py
+    change between tune and approve makes the proposal describe other metrics."""
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    target = tmp_path / "thresholds.yaml"
+    monkeypatch.setattr(tune, "L1_IMPL", "0000deadbeef0000")   # a newer l1.py
+    capsys.readouterr()
+    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    assert not target.exists()
+    assert "l1.py" in capsys.readouterr().out
+    monkeypatch.undo()
+    assert run_tune(str(cal), approve=True, target=str(target)) == 0
+
+
+def test_approve_refuses_a_proposal_without_an_l1_fingerprint(tmp_path):
+    rows, labels, l2 = _l2_fixture()
+    cal = mk_cal(tmp_path, rows, labels, l2=l2)
+    assert run_tune(str(cal)) == 0
+    p = cal / "thresholds.proposed.yaml"
+    data = yaml.safe_load(p.read_text())
+    del data["provenance"]["l1_impl"]
+    p.write_text(yaml.safe_dump(data, sort_keys=False))
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    assert not target.exists()
+
+
+# --------------- [review fix-calib-2] attribution: a judge ERROR is not a catch
+
+def test_judge_error_is_not_counted_as_l2_catching_the_clip():
+    """[agent-diffs#6] The 'would each layer catch it on its own' table drives the
+    8B -> 32B escalation call: a judge that errors must not look like one that
+    catches defects."""
+    labels = {"d0": {"verdict": "fail", "classes": ["deformed"]},
+              "d1": {"verdict": "fail", "classes": ["deformed"]},
+              "s0": {"verdict": "fail", "classes": ["static"]},
+              "p0": {"verdict": "pass", "classes": []}}
+    metrics = {c: dict(BASE_M) for c in labels}
+    metrics["s0"] = dict(BASE_M, flow_mag_median=1e-5)
+    l1_section = {"motion": {"metric": "flow_mag_median", "op": ">=", "value": 0.001}}
+    l2_rows = {"d0": {"error": "l2: judge context overflow"},
+               "d1": {"dimensions": {d: 4 for d in DIMS} | {"subject_consistency": 2},
+                      "na": {}},
+               "s0": {"error": "l2: judge context overflow"},
+               "p0": {"dimensions": {d: 4 for d in DIMS}, "na": {}}}
+    floors = {d: 3 for d in DIMS}
+    ev = tune.evaluate(sorted(labels), labels, metrics, l1_section, l2_rows, floors)
+    by_class = ev["attribution"]["by_class"]
+    assert by_class["deformed"].get("L2 only", 0) == 1          # d1 only, not d0
+    assert by_class["deformed"].get("both", 0) == 0
+    assert by_class["deformed"].get(tune.ATTR_L2_ERROR_L1_MISSES) == 1
+    assert by_class["static"].get("both", 0) == 0               # s0: L1 caught it
+    assert by_class["static"].get(tune.ATTR_L2_ERROR_L1_CATCHES) == 1
+    # the runtime decision is unchanged: a judge ERROR never ships
+    assert ev["attribution"]["stopped_by"]["L2 error"] == 1
+    assert ev["clips"]["d0"]["predicted"] == "ERROR"
+    md = "\n".join(tune._attribution_md(ev))
+    assert tune.ATTR_L2_ERROR_L1_MISSES in md and tune.ATTR_L2_ERROR_L1_CATCHES in md

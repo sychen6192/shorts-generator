@@ -105,13 +105,24 @@ Wan). Run plain `shortsloop doctor` before any unattended night.
 
 ## 2. Phase 0 — calibration (one afternoon, two hard gates)
 
+The GPU steps (2a, and 2c's judge wave) take the nightly runner's lock,
+`<paths.runs_dir>/.shortsloop.lock`: while a `shortsloop run` holds it they refuse
+with exit 2 (and vice versa) — one GPU user at a time. The lock path comes from
+`paths.runs_dir` in config.yaml (default `runs`, relative to the working
+directory), so set it to an absolute path and do not override it with
+`run --runs-dir`: calibration and cron must resolve the SAME directory, or the
+lock protects nothing. Both steps read pipeline.yaml the same way the runner
+does; a malformed `policies:` block is a refusal (exit 2).
+
 ```bash
 # 2a. ~40 draft-res clips, deliberately spanning good and bad (~30-40 min GPU)
 .venv/bin/shortsloop calibrate-batch --count 40
-#     Before the first Wan job it unloads the judge VLM + rewrite LLM, /free's
-#     ComfyUI and VERIFIES free VRAM (pipeline.yaml vram_handoff) — exit 3 if a
-#     model is still resident. One job at a time: it waits for an empty ComfyUI
-#     queue before every submit and removes a timed-out job before moving on.
+#     Refuses (exit 2) up front if config.yaml's judge could not be unloaded
+#     (`openai_compat` without `judge.unload_url`) or another process holds the
+#     run lock. Before the first Wan job it unloads the judge VLM + rewrite LLM,
+#     /free's ComfyUI and VERIFIES free VRAM (pipeline.yaml vram_handoff) — exit 3
+#     if a model is still resident. One job at a time: it waits for an empty
+#     ComfyUI queue before every submit and removes a timed-out job before moving on.
 #     Resume-safe: Ctrl-C stops the in-flight ComfyUI job, then re-run the same
 #     command; finished rows are skipped. 4 prompt-swap rows (a clip shown with
 #     a DIFFERENT good prompt) are the off-prompt ground truth.
@@ -129,8 +140,12 @@ Wan). Run plain `shortsloop doctor` before any unattended night.
 
 # 2c. score the batch with the VLM judge, then tune
 .venv/bin/shortsloop calibrate-tune --with-l2
-#     Judging starts only after ComfyUI is /free'd and free VRAM is verified
-#     (needs comfy.host in config.yaml); the judge is unloaded afterwards.
+#     The judge scores clips exactly as the nightly checker will: config.yaml's
+#     judge with pipeline.yaml's judge timeout_s/retries. Refuses (exit 2) a judge
+#     it could not unload (`openai_compat` without `judge.unload_url`) and while
+#     another process holds the run lock. Judging starts only after ComfyUI is
+#     /free'd and free VRAM is verified (needs comfy.host in config.yaml); the
+#     judge is unloaded afterwards.
 #     Scores are keyed by clip+prompt sha and judge model+digest; a clip the
 #     judge cannot evaluate is recorded (a runtime ERROR) and skipped on re-run.
 #     Tuning refuses (writes NO proposal) with < 10 usable labels, all-pass or
@@ -140,19 +155,43 @@ Wan). Run plain `shortsloop doctor` before any unattended night.
 #     read calibration/tuning_report.md: TEST agreement, FALSE-PASS = labeled-
 #     fail clips that would ship / all labeled-fail clips (+Wilson CI),
 #     false-fail, per-class confusion, per-layer catch attribution (L1 vs L2,
-#     and what each would catch alone) — for the combined L1+L2 decision.
+#     and what each would catch alone; clips the judge could not evaluate are
+#     counted in their own "L2 ERROR" columns, never as L2 catches) — for the
+#     combined L1+L2 decision.
+#     ⚠️ "L2 FLOORS ARE A FALLBACK" (report top, stdout, and
+#     provenance.l2_floors_fallback): the judge fails more labeled-pass clips
+#     than the 20% false-fail cap under EVERY floor (a dimension scored 1, or all
+#     N/A) — the clips are listed. The floors are then the least-bad combination
+#     (no false-fail beyond those clips), not a fit. The judge disagrees with
+#     your labels: re-check those clips, or escalate as below.
 #     If the 8B judge disagrees with your labels too often, pull a ~32B VL
 #     model, update config.yaml, and re-run this step: every clip is re-scored
 #     by the new judge and only its scores are used; provenance names it.
+#     Without --with-l2 (or with no scores from the configured judge) the
+#     proposal is L1-ONLY: its L2 floors are untuned defaults — see 2d.
 
 # 2d. sign off — THE gate that opens unattended running
 .venv/bin/shortsloop calibrate-tune --approve
 #     copies proposed thresholds → thresholds.yaml with calibrated: true, a
 #     version above the current one (YYYY-MM-DD.N) + provenance (labels sha,
-#     split, test stats, judge model+digest, input shas). Refuses if labels,
-#     manifest or judge scores changed after tuning, if the values were
-#     hand-edited, if labels.jsonl is gone, or if config.yaml's judge is not
-#     the judge the floors were tuned on.
+#     split, test stats, judge model+digest, L1 implementation fingerprint,
+#     input shas). Refuses if labels, manifest or judge scores changed after
+#     tuning, if the values were hand-edited or are off the frozen shape, if
+#     labels.jsonl is gone, if the L1 metric code (shortsloop/l1.py) changed
+#     since tuning (provenance.l1_impl — re-run 2c), if config.yaml's judge is
+#     not the judge the floors were tuned on, or if NO judge scores are behind
+#     the proposal (L1-only: untuned L2 floors are an uncalibrated instrument).
+#     It warns (and the marker stays in provenance) when the L2 floors are a
+#     fallback (2c).
+#
+#     Supervised exception, not the normal path — sign off an L1-only proposal:
+.venv/bin/shortsloop calibrate-tune --approve --accept-untested-l2
+#     Opens the gate with untuned default L2 floors and L1-only test numbers.
+#     It leaves a loud marker: provenance.test_scope stays "L1 only — …" and
+#     approve records provenance.l2_untested_accepted: true. It is a record,
+#     not a guard: the runner does not re-check it, so use it only when you
+#     will supervise the nights, and replace it with a judge-backed sign-off
+#     (2c + 2d) as soon as the judge works.
 ```
 
 Until 2d, `shortsloop run` refuses to start without `--allow-uncalibrated`.
