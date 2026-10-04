@@ -7,8 +7,11 @@ append-only JSONL. After generation, off-prompt ground truth is manufactured by
 prompt-swapping good rows (swap: true rows share the clip file, zero GPU cost).
 
 Hard rules on this GPU path, same as the nightly runner:
+- one GPU user: the runner's runs_dir/.shortsloop.lock is held for the whole
+  batch (shortsloop/lock.py) — refused (exit 2) while a nightly run holds it.
 - rule 3: before the first Wan job, the judge VLM + rewrite LLM are unloaded,
-  ComfyUI is /free'd and free VRAM is VERIFIED (gpu.to_generation).
+  ComfyUI is /free'd and free VRAM is VERIFIED (gpu.to_generation). A judge with
+  no way to unload (openai_compat without judge.unload_url) is refused up front.
 - rule 4: the ComfyUI queue must be empty before every submit; a failed or
   interrupted wait (incl. Ctrl-C) removes our job before anything else happens.
 
@@ -26,31 +29,18 @@ from pathlib import Path
 
 import yaml
 
-from .. import gpu
+from .. import gpu, lock
 from ..comfy import ComfyClient, GenerationFailed
 from ..errors import InfraError
 from ..rewrite import effective_rewrite_cfg
+# load_policies stays importable from here (thin alias): the ONE implementation is
+# shortsloop/settings.py — exactly how the nightly runner reads pipeline.yaml.
+from ..settings import effective_judge_cfg, judge_unload_problem, load_policies
 from ..state import _read_jsonl
 from .prompts import build_slate
 
 DRAFT = {"width": 480, "height": 832, "length": 81}
 N_SWAPS = 4
-
-
-def load_policies(pipeline_path: str | Path) -> dict:
-    """pipeline.yaml policies merged over the runner's defaults — exactly how the
-    nightly runner reads them, so calibration uses the same VRAM/queue limits."""
-    from ..runner import DEFAULT_POLICIES
-    pol = json.loads(json.dumps(DEFAULT_POLICIES))  # deep copy
-    p = Path(pipeline_path)
-    if p.is_file():
-        loaded = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        for key, val in (loaded.get("policies") or {}).items():
-            if isinstance(val, dict) and isinstance(pol.get(key), dict):
-                pol[key].update(val)
-            else:
-                pol[key] = val
-    return pol
 
 
 def plan_swaps(rows: list[dict], n_swaps: int = N_SWAPS) -> list[dict]:
@@ -91,8 +81,6 @@ def run_batch(config_path: str, out_dir: str, count: int = 40,
               pipeline_path: str = "pipeline.yaml") -> int:
     rng = rng or random.Random()
     out = Path(out_dir)
-    clips_dir = out / "clips"
-    manifest_path = out / "batch_manifest.jsonl"
 
     slate = build_slate(count)
     if dry_run:
@@ -106,9 +94,27 @@ def run_batch(config_path: str, out_dir: str, count: int = 40,
     if not Path(config_path).is_file():
         print(f"[calibrate-batch] config not found: {config_path}")
         return 2
-    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    try:
+        cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        print(f"[calibrate-batch] REFUSING: config {config_path} unreadable: {e}")
+        return 2
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("judge") or {}, dict):
+        print(f"[calibrate-batch] REFUSING: config {config_path} must be a mapping "
+              f"(with a judge: mapping, if any)")
+        return 2
+    try:
+        pol = load_policies(pipeline_path)
+    except InfraError as e:
+        print(f"[calibrate-batch] REFUSING: {e.message}")
+        return 2
+    # the judge the nightly runs — what must be evicted before Wan loads (rule 3)
+    judge_cfg = effective_judge_cfg(cfg, pol)
+    problem = judge_unload_problem(judge_cfg)
+    if problem:
+        print(f"[calibrate-batch] REFUSING: {problem}")
+        return 2
     comfy_cfg = cfg.get("comfy") or {}
-    pol = load_policies(pipeline_path)
     if comfy is None:
         if not comfy_cfg.get("host") or not comfy_cfg.get("workflow_t2v"):
             print("[calibrate-batch] config.yaml needs comfy.host and comfy.workflow_t2v")
@@ -117,6 +123,24 @@ def run_batch(config_path: str, out_dir: str, count: int = 40,
                             workflow=comfy_cfg["workflow_t2v"],
                             timeout_s=pol["comfy"]["timeout_s"],
                             poll_s=pol["comfy"]["poll_s"])
+    try:
+        held = lock.acquire(lock.runs_base(cfg))
+    except lock.LockHeld as e:
+        print(f"[calibrate-batch] REFUSING: another shortsloop process holds {e} — "
+              f"calibration and the nightly runner share one GPU and one ComfyUI "
+              f"queue (hard rules 3/4); re-run when it has finished")
+        return 2
+    try:
+        return _generate(cfg, pol, comfy, judge_cfg, slate, out, rng)
+    finally:
+        lock.release(held)
+
+
+def _generate(cfg: dict, pol: dict, comfy: ComfyClient, judge_cfg: dict,
+              slate: list[dict], out: Path, rng: random.Random) -> int:
+    """The GPU part of run_batch — runs only while the run lock is held."""
+    clips_dir = out / "clips"
+    manifest_path = out / "batch_manifest.jsonl"
     queue_timeout = float(pol["comfy"]["timeout_s"])
     handoff = pol["vram_handoff"]
 
@@ -138,7 +162,7 @@ def run_batch(config_path: str, out_dir: str, count: int = 40,
             if not handed_off:
                 # hard rule 3: no language model may sit in VRAM while Wan loads
                 free_gb, notes = gpu.to_generation(
-                    comfy, cfg.get("judge"), effective_rewrite_cfg(cfg),
+                    comfy, judge_cfg, effective_rewrite_cfg(cfg),
                     gpu.gen_free_min_gb(handoff), handoff["wait_timeout_s"])
                 print(f"[calibrate-batch] VRAM verified free for Wan: {free_gb:.1f} GB"
                       + (f" ({'; '.join(notes)})" if notes else ""), flush=True)

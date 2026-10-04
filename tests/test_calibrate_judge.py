@@ -13,6 +13,7 @@ import yaml
 from fake_comfy import serve_comfy
 from fake_judge import GOOD_SCORES, serve as serve_judge
 
+from shortsloop import lock
 from shortsloop.calibrate.tune import main_tune, score_with_judge
 from shortsloop.state import _read_jsonl
 
@@ -33,18 +34,20 @@ def _cal(tmp_path, clips, kinds=("moving", "static", "flicker")):
 
 
 def _env(tmp_path, comfy_host, judge_url, model="qwen3-vl:8b-instruct",
-         wait_timeout_s=2):
-    cfg = {"judge": {"adapter": "ollama", "base_url": judge_url, "model": model,
-                     "timeout_s": 30}}
+         wait_timeout_s=2, judge=None, judge_policy=None):
+    cfg = {"judge": judge or {"adapter": "ollama", "base_url": judge_url,
+                              "model": model, "timeout_s": 30},
+           "paths": {"runs_dir": str(tmp_path / "runs")}}   # the run lock lives here
     if comfy_host:
         cfg["comfy"] = {"host": comfy_host,
                         "workflow_t2v": str(DATA / "test_workflow.json")}
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     pipeline = tmp_path / "pipeline.yaml"
-    pipeline.write_text(yaml.safe_dump({"policies": {
-        "vram_handoff": {"free_min_gb": 20, "wait_timeout_s": wait_timeout_s}}}),
-        encoding="utf-8")
+    policies = {"vram_handoff": {"free_min_gb": 20, "wait_timeout_s": wait_timeout_s}}
+    if judge_policy:
+        policies["judge"] = judge_policy
+    pipeline.write_text(yaml.safe_dump({"policies": policies}), encoding="utf-8")
     return config, pipeline
 
 
@@ -159,3 +162,82 @@ def test_main_tune_with_l2_records_the_judge_in_provenance(clips, tmp_path):
     assert prov["judge"] == {"model": "ollama/qwen3-vl:32b",
                              "model_digest": "sha256:fakedigest"}
     assert "L1+L2" in prov["test_scope"]
+
+
+# ------------------------------- [review fix-calib-2] run lock, judge unload, policies
+
+def test_with_l2_refuses_while_another_process_holds_the_run_lock(clips, tmp_path,
+                                                                  capsys):
+    """[integration-seams#7] --with-l2 loads the VLM: it takes the nightly runner's
+    runs_dir/.shortsloop.lock and refuses (exit 2) with zero GPU contact — no /free,
+    no judge call — while another process holds it."""
+    cal = _cal(tmp_path, clips)
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (judge, jurl):
+        config, pipeline = _env(tmp_path, comfy.host, jurl)
+        held = lock.acquire(tmp_path / "runs")          # e.g. the nightly runner
+        try:
+            capsys.readouterr()
+            assert score_with_judge(str(cal), str(config),
+                                    pipeline_path=str(pipeline)) == 2
+            assert "lock" in capsys.readouterr().out
+            assert main_tune(["--calibration", str(cal), "--with-l2",
+                              "--config", str(config),
+                              "--pipeline", str(pipeline)]) == 2
+            assert judge.chat_calls == 0 and comfy.free_calls == 0
+            assert judge.generate_calls == 0
+            assert not (cal / "thresholds.proposed.yaml").exists()
+        finally:
+            lock.release(held)
+        assert score_with_judge(str(cal), str(config),
+                                pipeline_path=str(pipeline)) == 0
+        assert judge.chat_calls == 3
+    lock.release(lock.acquire(tmp_path / "runs"))       # released after the wave
+
+
+def test_with_l2_refuses_a_judge_it_could_not_unload(clips, tmp_path, capsys):
+    """[finding 7] openai_compat without judge.unload_url: the VLM could not be
+    evicted after the wave (hard rule 3) — refuse before /free or any judge call."""
+    from fake_openai import serve_openai
+    cal = _cal(tmp_path, clips)
+    with serve_comfy(fixture_paths=clips) as comfy, serve_openai() as (srv, ourl):
+        judge = {"adapter": "openai_compat", "base_url": ourl, "model": "qwen3-vl-8b"}
+        config, pipeline = _env(tmp_path, comfy.host, None, judge=judge)
+        capsys.readouterr()
+        assert score_with_judge(str(cal), str(config),
+                                pipeline_path=str(pipeline)) == 2
+        assert "unload_url" in capsys.readouterr().out
+        assert main_tune(["--calibration", str(cal), "--with-l2",
+                          "--config", str(config), "--pipeline", str(pipeline)]) == 2
+        assert srv.chat_calls == 0 and comfy.free_calls == 0
+    assert not (cal / "l2_scores.jsonl").exists()
+
+
+def test_with_l2_judges_with_the_nightly_judge_policy(clips, tmp_path):
+    """Calibration must score clips exactly the way the nightly checker will:
+    pipeline.yaml's judge retries/timeout_s are authoritative over config.yaml's
+    (settings.effective_judge_cfg — what the runner hands the checker)."""
+    cal = _cal(tmp_path, clips)
+    broken = {"prompt_adherence": {"score": 9, "na": False, "reason": "x"}}
+    with serve_comfy(fixture_paths=clips) as comfy, \
+            serve_judge(scores_queue=[broken]) as (judge, jurl):
+        cfg_judge = {"adapter": "ollama", "base_url": jurl,
+                     "model": "qwen3-vl:8b-instruct", "timeout_s": 30, "retries": 3}
+        config, pipeline = _env(tmp_path, comfy.host, jurl, judge=cfg_judge,
+                                judge_policy={"retries": 0})
+        assert score_with_judge(str(cal), str(config),
+                                pipeline_path=str(pipeline)) == 0
+        assert judge.chat_calls == 1 + 2     # nightly policy: no retry on cal000
+    rows = _read_jsonl(cal / "l2_scores.jsonl")
+    assert [r["clip_id"] for r in rows if r.get("error")] == ["cal000"]
+
+
+def test_with_l2_refuses_malformed_pipeline_policies(clips, tmp_path, capsys):
+    cal = _cal(tmp_path, clips)
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (judge, jurl):
+        config, pipeline = _env(tmp_path, comfy.host, jurl)
+        pipeline.write_text("policies:\n  judge: 5\n", encoding="utf-8")
+        capsys.readouterr()
+        assert score_with_judge(str(cal), str(config),
+                                pipeline_path=str(pipeline)) == 2
+        assert "policies" in capsys.readouterr().out
+        assert judge.chat_calls == 0 and comfy.free_calls == 0

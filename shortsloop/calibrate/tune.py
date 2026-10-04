@@ -29,8 +29,15 @@ Discipline:
   scores exist. Provenance carries those combined numbers.
 - Writes thresholds.proposed.yaml (calibrated: false) LAST, after everything
   succeeded. Flipping calibrated: true happens ONLY via --approve after the human
-  sign-off gate; --approve refuses stale inputs and edited values, and bumps the
-  version above the target's.
+  sign-off gate; --approve refuses stale inputs, edited values, a changed L1
+  implementation (l1_impl), a judge other than the tuned one, and a proposal with
+  NO judge scores behind it (untuned L2 floors = an uncalibrated instrument)
+  unless the supervised --accept-untested-l2 exception is passed, which is
+  recorded as provenance.l2_untested_accepted. It bumps the version above the
+  target's.
+- --with-l2 judges exactly as the nightly checker does (settings.
+  effective_judge_cfg), refuses a judge it could not unload, and holds the
+  runner's run lock while the VLM is on the GPU.
 """
 
 from __future__ import annotations
@@ -74,6 +81,10 @@ MIN_USABLE = 10
 SPLIT_SEED = 13
 # Fingerprint of the metric definitions: cached metrics from other l1 code are stale.
 L1_IMPL = (sha256_file(l1.__file__) or "unknown")[:16]
+# Attribution buckets for clips the judge could NOT score: an ERROR never ships at
+# runtime, but it is not the judge catching a defect (escalation decision, plan §6).
+ATTR_L2_ERROR_L1_CATCHES = "L2 ERROR (L1 catches)"
+ATTR_L2_ERROR_L1_MISSES = "L2 ERROR (L1 misses)"
 
 
 class Refused(Exception):
@@ -382,24 +393,52 @@ def l2_verdict(row: dict, floors: dict) -> tuple[bool, list[str]]:
 def tune_l2(pop_ids: list[str], labels: dict, l2_rows: dict) -> tuple[dict, dict]:
     """Joint floor search over the clips L2 actually sees (tune clips passing the
     proposed L1). Judge-error rows are runtime ERRORs whatever the floors are —
-    they do not inform floors (reported in the evaluation instead)."""
+    they do not inform floors (reported in the evaluation instead).
+
+    A labeled-pass clip the judge fails under EVERY combination (a non-N/A score
+    below the loosest floor, or every dimension N/A) is a false-fail no floor can
+    avoid. When there are more of those than the cap allows, nothing fits the cap:
+    the search then falls back EXPLICITLY to the least-bad floors — no false-fail
+    beyond the forced ones, fewest misses among those — and says so in
+    notes["fallback"] (-> report, stdout, provenance.l2_floors_fallback)."""
     scored = [c for c in pop_ids if not l2_rows[c].get("error")]
     bad = [c for c in scored if labels[c]["verdict"] == "fail"]
     good = [c for c in scored if labels[c]["verdict"] == "pass"]
     cap = _ff_cap(len(good))
+    lowest = min(FLOOR_CHOICES)
+    loosest = {d: lowest for d in L2_DIMS}
+    forced = [c for c in good if not l2_verdict(l2_rows[c], loosest)[0]]
+    limit = max(cap, len(forced))       # the loosest combination always fits this
+    fallback = None
+    if len(forced) > cap:
+        def why(row: dict) -> str:
+            na = row.get("na") or {}
+            low = [f"{d}={row['dimensions'][d]}" for d in L2_DIMS
+                   if not na.get(d) and row["dimensions"][d] < lowest]
+            return ", ".join(low) or "every dimension N/A"
+        fallback = (f"The judge fails {len(forced)}/{len(good)} labeled-pass tune clips "
+                    f"under EVERY floor combination ("
+                    + "; ".join(f"{c}: {why(l2_rows[c])}" for c in forced)
+                    + f") — more than the false-fail cap of {cap}, so no combination "
+                    f"fits it. Floors are the least-bad combination: no false-fail "
+                    f"beyond those {len(forced)}, fewest misses among them. The judge "
+                    f"disagrees with your labels — re-check those clips, or escalate to "
+                    f"a ~32B judge (runbook §2c)")
     best = None
     capped = None
     for combo in itertools.product(FLOOR_CHOICES, repeat=len(L2_DIMS)):
         floors = dict(zip(L2_DIMS, combo))
         missed = sum(1 for c in bad if l2_verdict(l2_rows[c], floors)[0])
         ff = sum(1 for c in good if not l2_verdict(l2_rows[c], floors)[0])
-        if ff > cap:
+        if ff > limit:
             if capped is None or (missed, ff) < capped:
                 capped = (missed, ff)
             continue
         key = (missed, ff, sum(abs(f - DEFAULT_FLOOR) for f in combo), combo)
         if best is None or key < best[0]:
             best = (key, floors)
+    if best is None:     # unreachable (the loosest combination fits `limit`)
+        raise Refused("internal: no L2 floor combination could be evaluated")
     (missed, ff, _, _), floors = best
     per_dim = {}
     for d in L2_DIMS:
@@ -412,10 +451,12 @@ def tune_l2(pop_ids: list[str], labels: dict, l2_rows: dict) -> tuple[dict, dict
     note = None
     if capped is not None and capped[0] < missed:
         note = (f"catching {missed - capped[0]} more would false-fail {capped[1]}/"
-                f"{len(good)} labeled-pass clips (cap {cap})")
+                f"{len(good)} labeled-pass clips (cap {cap}"
+                + (f"; fallback limit {limit}" if fallback else "") + ")")
     return floors, {"population": len(pop_ids), "n_bad": len(bad), "n_good": len(good),
                     "judge_errors": len(pop_ids) - len(scored), "missed_on_tune": missed,
                     "false_fail_on_tune": ff, "ff_cap": cap, "per_dim": per_dim,
+                    "forced_false_fail_ids": forced, "fallback": fallback,
                     "note": note}
 
 
@@ -441,7 +482,8 @@ def evaluate(ids: list[str], labels: dict, metrics: dict, l1_section: dict,
         if l2_rows is not None:
             row = l2_rows[cid]
             if row.get("error"):
-                l2_err, l2_fail, l2_catch = row["error"], [], True
+                # a runtime ERROR (never ships) — but NOT the judge catching it
+                l2_err, l2_fail = row["error"], []
             else:
                 ok, l2_fail = l2_verdict(row, floors)
                 l2_catch = not ok
@@ -469,8 +511,11 @@ def evaluate(ids: list[str], labels: dict, metrics: dict, l1_section: dict,
                 fn_ids.append(cid)
                 stopped["missed"] += 1
             if l2_rows is not None:
-                k = ("both" if l1_fail and l2_catch else "L1 only" if l1_fail
-                     else "L2 only" if l2_catch else "neither")
+                if l2_err:
+                    k = ATTR_L2_ERROR_L1_CATCHES if l1_fail else ATTR_L2_ERROR_L1_MISSES
+                else:
+                    k = ("both" if l1_fail and l2_catch else "L1 only" if l1_fail
+                         else "L2 only" if l2_catch else "neither")
                 cell = by_class.setdefault(truth, {})
                 cell[k] = cell.get(k, 0) + 1
         elif layer:
@@ -620,6 +665,8 @@ def _tune(cal: Path, target: str, judge: dict | None) -> dict:
                                           "labeled-pass test clips failed"),
             "test_scope": scope,
             "judge": identity,
+            # null unless no L2 floor combination fit the false-fail cap (tune_l2)
+            "l2_floors_fallback": (l2_notes or {}).get("fallback"),
             "l1_impl": L1_IMPL,
             "inputs_sha256": {
                 "batch_manifest": sha256_file(cal / "batch_manifest.jsonl"),
@@ -642,10 +689,10 @@ def _tune(cal: Path, target: str, judge: dict | None) -> dict:
 
 def run_tune(cal_dir: str, approve: bool = False, target: str = "thresholds.yaml",
              base_thresholds: str | None = None, judge: dict | None = None,
-             config_path: str | None = None) -> int:
+             config_path: str | None = None, accept_untested_l2: bool = False) -> int:
     cal = Path(cal_dir)
     if approve:
-        return _approve(cal, target, config_path)
+        return _approve(cal, target, config_path, accept_untested_l2)
     proposed_path = cal / "thresholds.proposed.yaml"
     try:
         res = _tune(cal, target, judge)
@@ -665,6 +712,10 @@ def run_tune(cal_dir: str, approve: bool = False, target: str = "thresholds.yaml
     test = res["ev"]["test"]
     print(f"[calibrate-tune] proposed thresholds: {proposed_path}")
     print(f"[calibrate-tune] report: {cal / 'tuning_report.md'}")
+    fallback = (res["l2_notes"] or {}).get("fallback")
+    if fallback:
+        print(f"[calibrate-tune] WARNING: L2 floors are a FALLBACK, not a fit — "
+              f"{fallback}")
     print(f"[calibrate-tune] TEST ({test['scope']}): agreement {test['agreement']:.0%}, "
           f"false-pass {test['false_pass']}/{test['n_bad']} labeled-fail clips, "
           f"false-fail {test['false_fail']}/{test['n_good']} labeled-pass clips — "
@@ -673,7 +724,8 @@ def run_tune(cal_dir: str, approve: bool = False, target: str = "thresholds.yaml
     return 0
 
 
-def _approve(cal: Path, target: str, config_path: str | None = None) -> int:
+def _approve(cal: Path, target: str, config_path: str | None = None,
+             accept_untested_l2: bool = False) -> int:
     def refuse(msg: str) -> int:
         print(f"[calibrate-tune] REFUSING approve: {msg}")
         return 2
@@ -708,6 +760,11 @@ def _approve(cal: Path, target: str, config_path: str | None = None) -> int:
                       "in provenance describe other values; re-run calibrate-tune")
     if not _real(prov.get("test_agreement")):
         return refuse("no held-out test evaluation in provenance")
+    if prov.get("l1_impl") != L1_IMPL:
+        return refuse(f"L1 metric code (shortsloop/l1.py) changed since tuning "
+                      f"(proposal l1_impl {prov.get('l1_impl')!r}, current {L1_IMPL!r}) — "
+                      f"the thresholds and test numbers describe other metric "
+                      f"definitions; re-run calibrate-tune")
     tuned_judge = (prov.get("judge") or {}).get("model") \
         if isinstance(prov.get("judge"), dict) else None
     cfg_judge = _configured_judge(config_path)
@@ -719,8 +776,23 @@ def _approve(cal: Path, target: str, config_path: str | None = None) -> int:
         print(f"[calibrate-tune] note: could not read the judge from {config_path}; "
               f"these floors are calibrated for {tuned_judge} only")
     if not tuned_judge:
-        print("[calibrate-tune] WARNING: no judge scores behind this proposal — L2 "
-              "floors are untuned defaults and the test numbers are L1-only")
+        if not accept_untested_l2:
+            return refuse(
+                "no judge scores behind this proposal (provenance.judge is null"
+                + (f"; {config_path} configures {cfg_judge}" if cfg_judge else "")
+                + ") — its L2 floors are untuned defaults and its test numbers are "
+                "L1-only. An uncalibrated judge is an uncalibrated instrument: run "
+                "`calibrate-tune --with-l2` with the judge you will run nightly. "
+                "Supervised exception only: --approve --accept-untested-l2 (recorded "
+                "in provenance as l2_untested_accepted: true)")
+        print("[calibrate-tune] WARNING: --accept-untested-l2 — signing off with NO "
+              "judge scores behind the L2 floors (untuned defaults; test numbers are "
+              "L1-only). Recorded as provenance.l2_untested_accepted: true; "
+              "test_scope stays L1-only.")
+        prov["l2_untested_accepted"] = True
+    if prov.get("l2_floors_fallback"):
+        print(f"[calibrate-tune] WARNING: signing off L2 floors that are a FALLBACK — "
+              f"{prov['l2_floors_fallback']} (kept in provenance.l2_floors_fallback)")
     data["version"] = next_version(target)
     data["calibrated"] = True
     prov["approved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -793,8 +865,11 @@ def _attribution_md(ev: dict) -> list[str]:
           f"{att['false_fail_by']['L2']}, by a judge ERROR: "
           f"{att['false_fail_by']['L2 error']}"]
     if att["by_class"]:
-        kinds = ("L1 only", "L2 only", "both", "neither")
-        md += ["", "Would each layer catch it on its own (L2 scored on every clip):", "",
+        kinds = ("L1 only", "L2 only", "both", "neither",
+                 ATTR_L2_ERROR_L1_CATCHES, ATTR_L2_ERROR_L1_MISSES)
+        md += ["", "Would each layer catch it on its own (L2 scored on every clip; a "
+                   "judge ERROR is counted apart — the judge did not catch that clip, "
+                   "it could not evaluate it):", "",
                "| labeled class | " + " | ".join(kinds) + " |",
                "|---|" + "---|" * len(kinds)]
         for cls in sorted(att["by_class"]):
@@ -829,6 +904,10 @@ def _write_report(cal: Path, res: dict, proposed_path: Path) -> None:
            f"run --approve**",
            f"- objective: zero false-pass on tune, but no threshold may fail more "
            f"than {FF_CAP_FRAC:.0%} of labeled-pass tune clips", ""]
+    l2_fallback = (res["l2_notes"] or {}).get("fallback")
+    if l2_fallback:
+        md += [f"- ⚠️ **L2 FLOORS ARE A FALLBACK — the objective above could not be "
+               f"met.** {l2_fallback}. Recorded as provenance.l2_floors_fallback.", ""]
     if res["other_judges"]:
         md += ["- scores from other judges ignored: "
                + ", ".join(f"`{m}` @ `{d}`" for m, d in res["other_judges"]), ""]
@@ -854,6 +933,8 @@ def _write_report(cal: Path, res: dict, proposed_path: Path) -> None:
                   f"L1 ({l2n['n_bad']} labeled fail, {l2n['n_good']} labeled pass, "
                   f"{l2n['judge_errors']} judge errors) under the runtime rule: N/A "
                   f"excluded, any non-N/A dimension below its floor fails the clip")
+        if l2n.get("fallback"):
+            md.append(f"- ⚠️ **FALLBACK — {l2n['fallback']}**")
         md.append(f"- missed {l2n['missed_on_tune']}, false-fail "
                   f"{l2n['false_fail_on_tune']} on tune"
                   + (f" — {l2n['note']}" if l2n["note"] else ""))
@@ -911,18 +992,23 @@ def score_with_judge(cal_dir: str, config_path: str,
                      out: dict | None = None) -> int:
     """--with-l2: score every manifest row with the configured VLM judge.
 
+    Scored exactly the way the nightly checker will: config.yaml's judge with
+    pipeline.yaml's judge timeout_s/retries (settings.effective_judge_cfg — what
+    the runner hands the checker). A judge that could not be unloaded after the
+    wave (openai_compat without judge.unload_url) is refused up front.
     Hard rule 3: ComfyUI's models are freed and free VRAM VERIFIED before the
     first judge call (gpu.to_judge, fail closed); the judge is unloaded in a
-    finally. Scores are keyed by (clip sha, prompt sha, judge model, digest):
-    switching judge (8B -> 32B) re-scores everything; a clip the judge cannot
-    evaluate gets an error row (reruns skip it) instead of aborting the batch.
-    GPU/workstation path — UNVERIFIED-ON-GPU in the cloud session."""
-    from .. import gpu
+    finally. The runner's run lock is held while the VLM is on the GPU (refused,
+    exit 2, while a nightly run holds it). Scores are keyed by (clip sha, prompt
+    sha, judge model, digest): switching judge (8B -> 32B) re-scores everything;
+    a clip the judge cannot evaluate gets an error row (reruns skip it) instead of
+    aborting the batch. GPU/workstation path — UNVERIFIED-ON-GPU in the cloud
+    session."""
+    from .. import lock
     from ..check import load_judge_config
     from ..comfy import ComfyClient
     from ..judge.base import make_adapter
-    from ..l2 import run_l2
-    from .batchgen import load_policies
+    from ..settings import effective_judge_cfg, judge_unload_problem, load_policies
 
     cal = Path(cal_dir)
     manifest = _read_jsonl(cal / "batch_manifest.jsonl")
@@ -930,11 +1016,21 @@ def score_with_judge(cal_dir: str, config_path: str,
         print(f"[calibrate-tune] no manifest in {cal}")
         return 2
     try:
-        judge_cfg = dict(load_judge_config(config_path))
+        load_judge_config(config_path)           # a judge: mapping is required
         cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
     except (InfraError, OSError, yaml.YAMLError) as e:
         print(f"[calibrate-tune] --with-l2 needs a usable judge config: "
               f"{getattr(e, 'message', e)}")
+        return 2
+    try:
+        pol = load_policies(pipeline_path)
+    except InfraError as e:
+        print(f"[calibrate-tune] REFUSING --with-l2: {e.message}")
+        return 2
+    judge_cfg = effective_judge_cfg(cfg, pol)    # exactly the nightly checker's judge
+    problem = judge_unload_problem(judge_cfg)
+    if problem:
+        print(f"[calibrate-tune] REFUSING --with-l2: {problem}")
         return 2
     comfy_cfg = cfg.get("comfy") or {}
     if not comfy_cfg.get("host"):
@@ -942,13 +1038,10 @@ def score_with_judge(cal_dir: str, config_path: str,
               "judge may only load after ComfyUI's models are freed (/free) and free "
               "VRAM is verified (hard rule 3)")
         return 2
-    pol = load_policies(pipeline_path)
-    judge_cfg.setdefault("timeout_s", pol["judge"]["timeout_s"])
     comfy = ComfyClient(host=str(comfy_cfg["host"]),
                         workflow=str(comfy_cfg.get("workflow_t2v") or ""),
                         timeout_s=pol["comfy"]["timeout_s"],
                         poll_s=pol["comfy"]["poll_s"])
-    floors = {d: DEFAULT_FLOOR for d in L2_DIMS}   # raw scores are what we keep
     try:
         adapter = make_adapter(judge_cfg)
         digest = adapter.model_digest()          # identity only (/api/tags), no VRAM
@@ -976,6 +1069,27 @@ def score_with_judge(cal_dir: str, config_path: str,
     if not todo:
         print(f"[calibrate-tune] every clip already scored by {model} ({digest})")
         return 0
+    try:
+        held = lock.acquire(lock.runs_base(cfg))
+    except lock.LockHeld as e:
+        print(f"[calibrate-tune] REFUSING --with-l2: another shortsloop process holds "
+              f"{e} — calibration and the nightly runner share one GPU (hard rules "
+              f"3/4); re-run when it has finished. No clip judged")
+        return 2
+    try:
+        return _judge_wave(cal, todo, comfy, judge_cfg, pol, model, digest)
+    finally:
+        lock.release(held)
+
+
+def _judge_wave(cal: Path, todo: list, comfy, judge_cfg: dict, pol: dict, model: str,
+                digest: str) -> int:
+    """The GPU part of --with-l2 — runs only while the run lock is held."""
+    from .. import gpu
+    from ..l2 import run_l2
+
+    scores_path = cal / "l2_scores.jsonl"
+    floors = {d: DEFAULT_FLOOR for d in L2_DIMS}   # raw scores are what we keep
     print(f"[calibrate-tune] judging {len(todo)} clip(s) with {model} ({digest}) — "
           f"freeing ComfyUI and verifying VRAM first (hard rule 3)", flush=True)
     handoff = pol["vram_handoff"]
@@ -1024,19 +1138,28 @@ def main_tune(argv: list[str] | None = None) -> int:
     ap.add_argument("--approve", action="store_true",
                     help="sign-off gate: copy proposed thresholds to --target with "
                          "calibrated: true")
+    ap.add_argument("--accept-untested-l2", action="store_true",
+                    help="with --approve only — SUPERVISED EXCEPTION: sign off a "
+                         "proposal with no judge scores behind its L2 floors "
+                         "(recorded as provenance.l2_untested_accepted: true)")
     ap.add_argument("--target", default="thresholds.yaml")
     ap.add_argument("--with-l2", action="store_true",
                     help="score the batch with the VLM judge first (workstation)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--pipeline", default="pipeline.yaml")
     args = ap.parse_args(argv)
+    if args.accept_untested_l2 and not args.approve:
+        print("[calibrate-tune] --accept-untested-l2 only modifies --approve (the "
+              "sign-off gate); nothing done")
+        return 2
     if args.approve:
         if args.with_l2:
             print("[calibrate-tune] --approve is the separate sign-off step: run "
                   "--with-l2 (and read the report) first")
             return 2
         return run_tune(args.calibration, approve=True, target=args.target,
-                        config_path=args.config)
+                        config_path=args.config,
+                        accept_untested_l2=args.accept_untested_l2)
     cfg_judge = _configured_judge(args.config)
     judge = {"model": cfg_judge, "model_digest": None} if cfg_judge else None
     if args.with_l2:
