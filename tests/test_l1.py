@@ -133,7 +133,7 @@ def test_dense_flicker_is_counted(all_metrics):
 def test_flicker_dips_near_zero_on_flicker_free_kinds(all_metrics):
     for kind in ("static", "moving", "blurry", "black", "freeze_tail"):
         dips = all_metrics[kind]["metrics"]["flicker_dips"]
-        assert dips <= 1, f"{kind} should be flicker-free, got flicker_dips={dips}"
+        assert dips == 0, f"{kind} should be flicker-free, got flicker_dips={dips}"
 
 
 def test_repo_placeholder_thresholds_fail_strobes_on_flicker(all_metrics):

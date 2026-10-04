@@ -141,6 +141,10 @@ for the first night), then:
 .venv/bin/shortsloop run --dispatch dispatch-YYYY-MM-DD.md
 ```
 
+Before Phase 0 is signed off you can rehearse with `--allow-uncalibrated`: PASS
+clips then land in `encoded_uncalibrated/` (never `encoded/`) and the report
+carries an UNCALIBRATED banner — a rehearsal, not a night's output.
+
 Watch the first one. Read `runs/<run_id>/report.md` against the definition of
 done: per-clip verdicts + reasons, silent QC MP4s of passing clips only, full
 `attempts.jsonl`, budget/cap evidence. Reproduce one clip from its
@@ -149,39 +153,59 @@ done: per-clip verdicts + reasons, silent QC MP4s of passing clips only, full
 ```bash
 COMFY_HOST=<host:port> python3 shortsloop/vendor/comfy_client.py run \
   -w <workflow> --prompt "<prompt_text>" --seed <seed> \
-  --width 720 --height 1280 --length 81
+  --width 720 --height 1280 --length 81 --fps 16 [--steps 8]
 ```
+(every value comes from the attempt's `patch_args`.)
 
 ## 4. Unattended nightly
 
 ```bash
 crontab -e
-# 02:00 nightly; wall-clock budget + retry caps bound the night (pipeline.yaml)
-0 2 * * * cd /path/to/shorts-generator && .venv/bin/shortsloop run \
-  --dispatch /path/to/tonight.md >> runs/cron.log 2>&1
+# cron runs with a minimal PATH: give it the one where `which ffmpeg ffprobe` worked
+# (the runner refuses to start without both — doctor prints their absolute paths)
+PATH=/usr/local/bin:/usr/bin:/bin
+# 01:58 nightly; wall-clock budget + retry caps bound the night (pipeline.yaml).
+# mkdir first: a redirect into a missing directory means the job never runs at all.
+58 1 * * * cd /path/to/shorts-generator && mkdir -p /big/disk/runs && \
+  .venv/bin/shortsloop run --dispatch /path/to/tonight.md >> /big/disk/runs/cron.log 2>&1
 ```
+
+Only one runner per runs directory: a second invocation (or an overlapping
+`--resume`) refuses with exit 2 while the first holds `runs/.shortsloop.lock`.
 
 Morning workflow: open `runs/<run_id>/report.md` → review contact sheets and
 reasons → layer audio per the dispatch sheet's 音檔需求 table and re-encode with
 `shortsloop/vendor/ig_encode.sh -a bgm.mp3 …` → upload (AI-content label on).
-A crashed run resumes with `shortsloop run --dispatch … --resume runs/<run_id>`
-— finished verdicts are reused, in-flight ComfyUI jobs re-attached.
+A crashed or halted run resumes with `shortsloop run --dispatch <the SAME sheet>
+--resume runs/<run_id>`: finished verdicts are reused (cache keyed by clip, prompt,
+thresholds and judge digest), in-flight ComfyUI jobs are re-attached before anything
+new is submitted, generated-but-unjudged clips go straight to the judge, and the
+wall-clock budget keeps counting from the time already spent. A different sheet is
+refused.
 
 ## 5. Exit codes & failure playbook
 
 | Symptom | Meaning / fix |
 |---|---|
-| `run` exits 2 before generating | Refusal: config/doctor/thresholds/dispatch intake — message says which. Nothing was burned. |
-| `run` exits 3, report says HALTED(infra) | Instrument broke mid-run (judge down, VRAM not freed, checker contract violated). Nothing shipped after the halt point. Fix, then `--resume`. |
+| `run` exits 2 before generating | Refusal: config / doctor snapshot (missing, failed, or taken for a different config/workflow/judge — re-run doctor) / thresholds off-shape or uncalibrated / dispatch intake (per-row errors listed) / workflow knobs not patchable / ffmpeg not on PATH / disk below floor / another run holds the lock. Nothing was burned. |
+| `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: judge down, VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts), ComfyUI queue busy or a stuck job that won't clear, 3 consecutive generation failures, 2 consecutive judge errors, checker contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix, then `--resume`. |
+| Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
-| Every clip ERRORs at L2 | `doctor` → vision probe. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp. |
+| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without an unload hook the next Wan wave halts on the VRAM check, by design. The raw judge reply is kept next to every ERROR verdict (`*.l2_raw.json`). |
 | OOM during generation | Runner already `/free`s and re-rolls; if chronic, drop to 480x832 or 81 frames in the dispatch sheet. |
-| Report shows `encode failed after PASS` | Clip passed QC but ffmpeg encode broke — raw file is kept in `runs/<id>/clips/`, encode manually. |
+| Report shows `encode failed after PASS` | Clip passed QC but the encode failed verification (size/fps/codec/aac/silence) or the clip bytes no longer match the verdict — nothing was left in `encoded/`; the raw file is kept in `runs/<id>/clips/`. |
+| `steps8 n/a` in attempt notes | The re-roll table's `--steps 8` is defined for the 4-step lightx2v build; your workflow runs another step count, so those re-rolls reseed only. |
 
 ## 6. What is still UNVERIFIED-ON-GPU (first-night checklist)
 
 - [ ] `doctor` fully green on the workstation
 - [ ] `calibrate-batch` produces 40 playable draft clips (spot-check 2-3)
-- [ ] judge wave actually fits in VRAM after `/free` (watch `nvidia-smi` once)
+- [ ] judge wave actually fits in VRAM after `/free` (watch `nvidia-smi` once), and
+      the judge->generation handoff sees the VLM gone (`generate ok layer=vram_handoff`
+      events in events.jsonl show the measured free VRAM)
+- [ ] handoff thresholds suit the card: `vram_handoff.free_min_gb` (24) must leave
+      the judge room; set `vram_handoff.gen_free_min_gb` so an idle card clears it but
+      one with the VLM still loaded (`ollama ps`) does not — otherwise the
+      judge->generation check cannot tell them apart
 - [ ] real Wan clip L1 metrics look sane vs fixtures (`shortsloop check --l1-only` on one)
 - [ ] E2E: one real ~6-clip dispatch sheet unattended → morning report (DoD)

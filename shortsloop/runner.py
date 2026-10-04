@@ -633,7 +633,7 @@ class Runner:
             return
         vh = self.pol["vram_handoff"]
         free_gb, notes = gpu.to_generation(self.comfy, self.judge_cfg, self.rewrite_cfg,
-                                           vh["free_min_gb"], vh["wait_timeout_s"])
+                                           gpu.gen_free_min_gb(vh), vh["wait_timeout_s"])
         self.log.event("generate", "ok", None, None, layer="vram_handoff",
                        vram_free_gb=round(free_gb, 1), notes=notes)
         self._gen_ready = True

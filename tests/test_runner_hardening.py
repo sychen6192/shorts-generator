@@ -423,3 +423,15 @@ def test_pipeline_judge_policy_reaches_the_checker(clips, tmp_path):
         assert runner.run() == 0
         snap = yaml.safe_load((runner.run_dir / "config.snapshot.yaml").read_text())
         assert snap["judge"]["retries"] == 0 and snap["judge"]["timeout_s"] == 45
+
+
+def test_stricter_generation_threshold_is_honoured(clips, tmp_path):
+    """22 GB free would satisfy the judge's 20 GB floor, but the generation side is
+    configured stricter (VLM still resident) -> halt before any submission."""
+    with serve_comfy(fixture_paths=clips, free_results=[22.0]) as comfy, \
+         serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl, policies_over={
+            "vram_handoff": {"free_min_gb": 20, "gen_free_min_gb": 26,
+                             "wait_timeout_s": 2}})
+        assert make_runner(small_sheet(tmp_path), env).run() == 3
+        assert comfy.submissions == []

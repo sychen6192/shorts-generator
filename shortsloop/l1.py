@@ -107,9 +107,9 @@ def flicker_dips(ssims, lumas) -> int:
     """The `flicker_dips` metric (docs/plan.md §2.2, amended 2026-10-04: dense flicker).
 
     Sum of two counts:
-    - SSIM dips: pairs whose SSIM is >= FLICKER_DELTA below the median SSIM of the
-      neighboring pairs (up to FLICKER_WIN // 2 on each side, pair itself excluded).
-      Catches isolated pops.
+    - SSIM dips (unchanged from v1): pairs whose SSIM is >= FLICKER_DELTA below the
+      rolling median of a FLICKER_WIN window centred on the pair. Catches isolated
+      pops.
     - Luma reversals: frames whose mean-luma change reverses sign relative to the
       previous change with |Δluma| >= LUMA_FLICKER_DELTA on both sides. Catches dense
       flicker (alternate-frame strobing, period-2/3 pulsing, strobe bursts) where every
@@ -120,8 +120,8 @@ def flicker_dips(ssims, lumas) -> int:
     half = FLICKER_WIN // 2
     dips = 0
     for i in range(len(s)):
-        nbrs = np.concatenate([s[max(0, i - half):i], s[i + 1:i + half + 1]])
-        if len(nbrs) and float(np.median(nbrs)) - s[i] >= FLICKER_DELTA:
+        window = s[max(0, i - half): i + half + 1]
+        if float(np.median(window)) - s[i] >= FLICKER_DELTA:
             dips += 1
 
     dl = np.diff(np.asarray(lumas, dtype=np.float64))

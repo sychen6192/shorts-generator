@@ -139,7 +139,7 @@ def run_batch(config_path: str, out_dir: str, count: int = 40,
                 # hard rule 3: no language model may sit in VRAM while Wan loads
                 free_gb, notes = gpu.to_generation(
                     comfy, cfg.get("judge"), effective_rewrite_cfg(cfg),
-                    handoff["free_min_gb"], handoff["wait_timeout_s"])
+                    gpu.gen_free_min_gb(handoff), handoff["wait_timeout_s"])
                 print(f"[calibrate-batch] VRAM verified free for Wan: {free_gb:.1f} GB"
                       + (f" ({'; '.join(notes)})" if notes else ""), flush=True)
                 handed_off = True

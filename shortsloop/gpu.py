@@ -58,6 +58,13 @@ def unload_llms(judge_cfg: dict | None, rewrite_cfg: dict | None = None,
     return notes
 
 
+def gen_free_min_gb(handoff_policy: dict) -> float:
+    """Threshold for the judge->generation check. A resident 8B VLM can leave more
+    than the judge's own `free_min_gb` free on a 32 GB card, so this direction may
+    be set stricter (`vram_handoff.gen_free_min_gb`); default: the shared value."""
+    return float(handoff_policy.get("gen_free_min_gb", handoff_policy["free_min_gb"]))
+
+
 def to_judge(comfy, free_min_gb: float, wait_timeout_s: float,
              sleep=time.sleep) -> float:
     """Generation -> judge: Wan out (/free), verified free VRAM."""

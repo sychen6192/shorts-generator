@@ -30,5 +30,5 @@ from append-only JSONL.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -q   # 80+ tests, CPU-only: synthetic fixtures + fake ComfyUI/judge
+.venv/bin/pytest -q   # ~300 tests, CPU-only: synthetic fixtures + fake ComfyUI/judge
 ```
