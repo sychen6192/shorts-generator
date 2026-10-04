@@ -17,7 +17,6 @@ thresholds all stop work rather than ship a clip or burn the night quietly.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import random
 import shutil
@@ -30,7 +29,7 @@ from pathlib import Path
 
 import yaml
 
-from . import gpu
+from . import gpu, lock
 from .check import load_thresholds
 from .comfy import ComfyClient, GenerationFailed
 from .dispatch import ClipSpec, parse_dispatch
@@ -40,18 +39,10 @@ from .policy import plan_reroll
 from .report import contact_sheet, render
 from .rewrite import effective_rewrite_cfg, rewrite_prompt
 from .schema import validate_verdict_file
+from .settings import (DEFAULT_POLICIES, effective_judge_cfg,  # noqa: F401
+                       judge_unload_problem, load_policies)
 from .state import RunLog, active_seconds, fold
 from .verdict import sha256_file, sha256_text
-
-DEFAULT_POLICIES = {
-    "max_attempts_per_clip": 3,
-    "wall_clock_budget_h": 6,
-    "disk_min_free_gb": 20,
-    "waves_max": 3,
-    "comfy": {"timeout_s": 1800, "poll_s": 5, "one_job_at_a_time": True},
-    "judge": {"timeout_s": 300, "retries": 1, "infra_escalation_after": 2},
-    "vram_handoff": {"free_min_gb": 24, "wait_timeout_s": 180},
-}
 
 # Nightly defaults (plan §0.4: 720x1280, 81 frames @ 16 fps — Wan 2.2 14B native).
 GEN_DEFAULTS = {"width": 720, "height": 1280, "length": 81, "fps": 16.0}
@@ -186,15 +177,10 @@ class Runner:
             if refusal is not None:
                 return refusal
 
-        pol = json.loads(json.dumps(DEFAULT_POLICIES))  # deep copy
-        if self.pipeline_path.is_file():
-            loaded = yaml.safe_load(self.pipeline_path.read_text(encoding="utf-8")) or {}
-            for key, val in (loaded.get("policies") or {}).items():
-                if isinstance(val, dict) and isinstance(pol.get(key), dict):
-                    pol[key].update(val)
-                else:
-                    pol[key] = val
-        self.pol = pol
+        try:
+            self.pol = load_policies(self.pipeline_path)
+        except InfraError as e:
+            return self._refuse(str(e))
 
         try:
             _thr, thr_info = load_thresholds(self.thresholds_path)
@@ -240,10 +226,10 @@ class Runner:
             return self._refuse("; ".join(problems))
 
         # pipeline.yaml's judge policy is authoritative for the runner's checker
-        judge_cfg = dict(self.cfg["judge"])
-        judge_cfg["timeout_s"] = self.pol["judge"]["timeout_s"]
-        judge_cfg["retries"] = self.pol["judge"]["retries"]
-        self.judge_cfg = judge_cfg
+        self.judge_cfg = effective_judge_cfg(self.cfg, self.pol)
+        problem = judge_unload_problem(self.judge_cfg)
+        if problem:
+            return self._refuse(problem)
         self.rewrite_cfg = effective_rewrite_cfg(self.cfg)
         return None
 
@@ -280,23 +266,17 @@ class Runner:
                                      .get("runs_dir", "runs"))
 
     def _acquire_lock(self) -> int | None:
-        """One runner per runs dir (and so per ComfyUI) — hard rule 4 starts here."""
+        """One GPU user per runs dir (shortsloop/lock.py) — hard rule 4 starts here."""
         base = self.resume_dir.parent if self.resume_dir else self._runs_base()
-        base.mkdir(parents=True, exist_ok=True)
-        fh = open(base / ".shortsloop.lock", "a+")
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            fh.close()
-            return self._refuse(f"another shortsloop run holds {base / '.shortsloop.lock'}")
-        self._lock = fh
+            self._lock = lock.acquire(base)
+        except lock.LockHeld as e:
+            return self._refuse(f"another shortsloop process holds {e}")
         return None
 
     def _release_lock(self) -> None:
-        if self._lock is not None:
-            fcntl.flock(self._lock, fcntl.LOCK_UN)
-            self._lock.close()
-            self._lock = None
+        lock.release(self._lock)
+        self._lock = None
 
     def _disk_free(self, where: Path) -> float:
         return (self._disk_free_gb() if callable(self._disk_free_gb)

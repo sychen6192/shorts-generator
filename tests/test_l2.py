@@ -190,9 +190,8 @@ GOOD_JSON = json.dumps(GOOD_SCORES)
     f"```\n{GOOD_JSON}\n```\n",
     f"<think>\nframes 1-8 look {{consistent}}; nothing melts\n</think>\n\n{GOOD_JSON}",
     f"<think>ok</think>\n```json\n{GOOD_JSON}\n```",
-    f"Here is my evaluation:\n{GOOD_JSON}\nThanks.",
     f"frames {{1-8}} reviewed; no melting\n</think>\n\n{GOOD_JSON}",
-], ids=["json-fence", "bare-fence", "think-prefix", "think-and-fence", "prose",
+], ids=["json-fence", "bare-fence", "think-prefix", "think-and-fence",
         "template-opened-think"])
 def test_wrapped_json_reply_is_parsed_without_retry(clips, reply):
     with serve() as (srv, url):
@@ -212,7 +211,14 @@ def test_wrapped_json_reply_is_parsed_without_retry(clips, reply):
     f"draft: {GOOD_JSON}\nfinal: {GOOD_JSON}",
     "<think>unterminated reasoning {",
     "```json\n```",
-], ids=["fenced-type-confused", "two-objects", "unterminated-think", "empty-fence"])
+    # hard rule 2: a reply that is not ONLY the verdict object is never a verdict
+    f"<think>\nDraft: {GOOD_JSON}\nWait, frame 3 shows a fused hand, so anatomy",
+    f"I cannot evaluate these frames. Example format: {GOOD_JSON}",
+    f"{GOOD_JSON}\nCorrection: anatomy_artifacts is actually 1.",
+    f"Here is my evaluation:\n{GOOD_JSON}\nThanks.",
+], ids=["fenced-type-confused", "two-objects", "unterminated-think", "empty-fence",
+        "unterminated-think-with-draft", "refusal-quoting-example",
+        "json-then-correction", "prose-around-json"])
 def test_unwrapped_reply_still_validated_strictly(clips, reply):
     with serve() as (srv, url):
         srv.content = lambda: reply
@@ -409,3 +415,20 @@ def test_openai_compat_wrapped_reply_parsed(clips):
         block, raw = run_l2(clips["moving"], {"fps": 16.0}, "p", ocfg(url), FLOORS)
         assert srv.chat_calls == 1
     assert block["pass"] is True and raw == reply
+
+
+@pytest.mark.parametrize("adapter, body", [
+    ("ollama", {"message": {"content": json.dumps(GOOD_SCORES)}, "done": True,
+                "done_reason": "length"}),
+    ("openai_compat", {"choices": [{"message": {"content": json.dumps(GOOD_SCORES)},
+                                    "finish_reason": "length"}]}),
+])
+def test_truncated_reply_is_retryable_not_a_verdict(adapter, body, monkeypatch):
+    """A reply cut off by the token limit is not the judge's answer, even if what
+    survived happens to parse."""
+    from shortsloop.judge import make_adapter
+    from shortsloop.judge.base import JudgeAdapter, RetryableJudgeError
+    monkeypatch.setattr(JudgeAdapter, "_post_json", lambda self, *a, **k: body)
+    a = make_adapter({"adapter": adapter, "base_url": "http://x", "model": "m"})
+    with pytest.raises(RetryableJudgeError):
+        a.judge([b"jpg"], "sys", "user", {}, 5)

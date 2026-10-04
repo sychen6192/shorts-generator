@@ -146,13 +146,16 @@ _FENCE_RE = re.compile(r"\A```[\w-]*[ \t]*\n?(.*?)\n?[ \t]*```\Z", re.DOTALL)
 
 
 def _strip_wrappers(raw: str) -> str:
-    """Remove a leading <think>...</think> block (also the bare `...</think>` form,
-    when the opening tag lived in the chat template) and one surrounding ``` fence."""
+    """Remove ONE complete leading <think>...</think> block (also the bare
+    `...</think>` form, when the opening tag lived in the chat template) and one
+    surrounding ``` fence. An unterminated <think> means the judge never gave its
+    answer: retryable, never parsed (hard rule 2)."""
     text = raw.strip()
     if text.startswith("<think>"):
         end = text.find("</think>")
-        if end != -1:
-            text = text[end + len("</think>"):].strip()
+        if end == -1:
+            raise RetryableJudgeError("unterminated <think> block — no final answer")
+        text = text[end + len("</think>"):].strip()
     elif "</think>" in text and not text.startswith(("{", "```")):
         text = text.split("</think>", 1)[1].strip()
     m = _FENCE_RE.match(text)
@@ -162,20 +165,14 @@ def _strip_wrappers(raw: str) -> str:
 
 
 def _load_json(raw: str):
-    """Parse the judge reply tolerantly: unwrap <think>/fences and parse; failing
-    that, parse the single outermost {...} span. Anything else is retryable."""
+    """The reply must BE the verdict object once wrappers are removed. No
+    searching for a {...} inside prose: a refusal quoting an example, a draft in
+    unfinished reasoning, or JSON followed by a correction is not a verdict."""
     text = _strip_wrappers(raw)
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        first_err = e
-    lo, hi = text.find("{"), text.rfind("}")
-    if lo != -1 and hi > lo:
-        try:
-            return json.loads(text[lo:hi + 1])
-        except json.JSONDecodeError:
-            pass
-    raise RetryableJudgeError(f"judge content is not valid JSON: {first_err}")
+        raise RetryableJudgeError(f"judge content is not (only) a JSON object: {e}")
 
 
 def _parse_response(raw: str) -> dict:

@@ -59,6 +59,10 @@ class OllamaAdapter(JudgeAdapter):
             ],
         }
         res = self._post_json("/api/chat", payload, timeout_s)
+        if res.get("done_reason") == "length":
+            from .base import RetryableJudgeError
+            raise RetryableJudgeError("ollama reply truncated at the token limit "
+                                      "(done_reason=length) — not a final answer")
         content = (res.get("message") or {}).get("content")
         if not isinstance(content, str) or not content.strip():
             from .base import RetryableJudgeError

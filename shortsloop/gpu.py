@@ -77,6 +77,9 @@ def to_generation(comfy, judge_cfg: dict | None, rewrite_cfg: dict | None,
     """Judge -> generation (and before any first generation): unload the VLM and
     the rewrite LLM, /free ComfyUI's caches, then VERIFY the GPU is empty enough
     that Wan never shares VRAM with a resident language model."""
+    # A busy queue first: real ComfyUI defers /free until the running job ends, so
+    # a VRAM timeout here would wrongly blame the (already unloaded) judge.
+    comfy.wait_queue_empty(wait_timeout_s, sleep=sleep)
     notes = unload_llms(judge_cfg, rewrite_cfg)
     comfy.free()
     try:

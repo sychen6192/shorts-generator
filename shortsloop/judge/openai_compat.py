@@ -65,8 +65,11 @@ class OpenAICompatAdapter(JudgeAdapter):
         }
         res = self._post_json("/v1/chat/completions", payload, timeout_s)
         try:
+            if res["choices"][0].get("finish_reason") == "length":
+                raise RetryableJudgeError("openai-compat reply truncated at the token "
+                                          "limit (finish_reason=length)")
             content_out = res["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             raise RetryableJudgeError("openai-compat response missing choices[0].message.content")
         if not isinstance(content_out, str) or not content_out.strip():
             raise RetryableJudgeError("openai-compat response has empty content")
