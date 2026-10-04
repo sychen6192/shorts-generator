@@ -309,3 +309,10 @@ def run_checks(metrics: dict, thresholds_l1: dict) -> list[dict]:
             "reason": "ok" if ok else _CHECK_REASONS.get(name, f"{metric} {op} {value} violated"),
         })
     return checks
+
+
+def impl_fingerprint() -> str:
+    """Identity of the L1 metric code: thresholds tuned against one version of
+    these metrics are meaningless for another (tune records it, runner checks it)."""
+    from .verdict import sha256_file
+    return (sha256_file(__file__) or "unknown")[:16]

@@ -34,6 +34,7 @@ from .check import load_thresholds
 from .comfy import ComfyClient, GenerationFailed
 from .dispatch import ClipSpec, parse_dispatch
 from .encode import EncodeFailed, encode_silent
+from .l1 import impl_fingerprint
 from .errors import CheckError, InfraError
 from .policy import plan_reroll
 from .report import contact_sheet, render
@@ -189,6 +190,12 @@ class Runner:
             return self._refuse(str(e))
         self.thresholds_provenance = _thr.get("provenance") or {}
         self.thresholds_calibrated = thr_info["calibrated"]
+        tuned_l1 = self.thresholds_provenance.get("l1_impl")
+        if self.thresholds_calibrated and tuned_l1 and tuned_l1 != impl_fingerprint():
+            return self._refuse(
+                f"thresholds were tuned against different L1 metric code (l1_impl "
+                f"{tuned_l1} != {impl_fingerprint()}) — the calibrated values no longer "
+                f"mean what was signed off; re-run calibrate-tune and --approve")
         self.thresholds_version = thr_info["version"]
         self.thresholds_sha = thr_info["file_sha256"]
         if not self.thresholds_calibrated and not self.allow_uncalibrated:
@@ -262,7 +269,7 @@ class Runner:
             return self._refuse(
                 f"last doctor run FAILED ({', '.join(failed) or 'see doctor.json'})"
                 f" — fix and re-run `shortsloop doctor`")
-        current = fingerprint(self.config_path)
+        current = fingerprint(self.config_path, self.pipeline_path)
         if snap.get("fingerprint") != current:
             changed = sorted(k for k in current
                              if (snap.get("fingerprint") or {}).get(k) != current[k])
@@ -1095,6 +1102,9 @@ class Runner:
             "dispatch_sha256": self.sheet.sha256,
             "thresholds_version": self.thresholds_version,
             "thresholds_calibrated": self.thresholds_calibrated,
+            "thresholds_provenance": {k: self.thresholds_provenance.get(k) for k in
+                                      ("test_scope", "l2_untested_accepted",
+                                       "l2_floors_fallback", "judge")},
             "allow_uncalibrated": self.allow_uncalibrated,
             "gen_params": self.gen_params,
             "gen_fallback": self.gen_fallback,

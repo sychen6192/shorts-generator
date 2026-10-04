@@ -38,9 +38,11 @@ def load_policies(pipeline_path: str | Path | None) -> dict:
         return pol
     try:
         loaded = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as e:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         raise InfraError("l1", f"pipeline file {p} unreadable: {e}")
-    policies = loaded.get("policies") if isinstance(loaded, dict) else None
+    if not isinstance(loaded, dict):
+        raise InfraError("l1", f"pipeline file {p} is not a mapping")
+    policies = loaded.get("policies")
     if policies is None:
         return pol
     if not isinstance(policies, dict):

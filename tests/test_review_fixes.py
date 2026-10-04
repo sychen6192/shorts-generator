@@ -338,3 +338,46 @@ def test_halted_report_gives_a_resume_command_the_cli_accepts(clips, tmp_path):
         md = (runner.run_dir / "report.md").read_text()
         assert f"--dispatch {runner.run_dir / 'dispatch.md'}" in md
         assert f"--resume {runner.run_dir}" in md
+
+
+# ------------------------------------------------------------ follow-ups from the agents
+
+def test_pipeline_policy_edited_after_doctor_closes_the_gate(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        env["pipeline"].write_text(env["pipeline"].read_text() + "# edited after doctor\n")
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+        assert comfy.submissions == []
+
+
+@pytest.mark.parametrize("raw", [b"\xff\xfe policies: {}", b"- just\n- a list\n"])
+def test_unusable_pipeline_files_are_infra_errors(tmp_path, raw):
+    from shortsloop.settings import load_policies
+    p = tmp_path / "pipeline.yaml"
+    p.write_bytes(raw)
+    with pytest.raises(InfraError):
+        load_policies(p)
+
+
+def test_thresholds_tuned_against_other_l1_code_refuse(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        thr = yaml.safe_load(env["thresholds"].read_text())
+        thr["provenance"] = {"l1_impl": "0123456789abcdef"}
+        env["thresholds"].write_text(yaml.safe_dump(thr))
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+
+
+def test_report_shows_calibration_caveats(clips, tmp_path):
+    from shortsloop.l1 import impl_fingerprint
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        thr = yaml.safe_load(env["thresholds"].read_text())
+        thr["provenance"] = {"l1_impl": impl_fingerprint(), "test_scope": "L1 only — x",
+                             "l2_untested_accepted": True,
+                             "l2_floors_fallback": {"note": "least-bad floors"}}
+        env["thresholds"].write_text(yaml.safe_dump(thr))
+        runner = make_runner(small_sheet(tmp_path), env)
+        assert runner.run() == 0
+        md = (runner.run_dir / "report.md").read_text()
+        assert "L2 floors untested" in md and "fallback" in md

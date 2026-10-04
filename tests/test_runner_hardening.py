@@ -376,7 +376,8 @@ def test_resume_refuses_a_different_dispatch_sheet(clips, tmp_path):
 def _refresh_doctor(env):
     from shortsloop.doctor import fingerprint
     (env["config"].parent / "doctor.json").write_text(json.dumps(
-        {"ok": True, "checks": [], "fingerprint": fingerprint(env["config"])}))
+        {"ok": True, "checks": [],
+         "fingerprint": fingerprint(env["config"], env["pipeline"])}))
 
 
 def test_doctor_snapshot_for_another_setup_does_not_open_the_gate(clips, tmp_path):

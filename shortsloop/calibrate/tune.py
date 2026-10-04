@@ -80,7 +80,7 @@ FF_CAP_FRAC = 0.2        # max share of labeled-pass tune clips one threshold ma
 MIN_USABLE = 10
 SPLIT_SEED = 13
 # Fingerprint of the metric definitions: cached metrics from other l1 code are stale.
-L1_IMPL = (sha256_file(l1.__file__) or "unknown")[:16]
+L1_IMPL = l1.impl_fingerprint()
 # Attribution buckets for clips the judge could NOT score: an ERROR never ships at
 # runtime, but it is not the judge catching a defect (escalation decision, plan §6).
 ATTR_L2_ERROR_L1_CATCHES = "L2 ERROR (L1 catches)"

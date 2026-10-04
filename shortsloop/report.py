@@ -116,8 +116,18 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
                   f"{gen.get('length')} frames @ {gen.get('fps'):g} fps — "
                   + (f"⚠️ fallback defaults for {', '.join(sorted(fb))} (not in the "
                      f"sheet's 共用參數)" if fb else "from the sheet") + " |")
+    prov = run_meta.get("thresholds_provenance") or {}
+    caveats = []
+    if prov.get("l2_untested_accepted"):
+        caveats.append("⚠️ L2 floors untested (approved L1-only)")
+    if prov.get("l2_floors_fallback"):
+        caveats.append("⚠️ L2 floors are a fallback (no combination fit the "
+                       "false-fail cap)")
+    if prov.get("test_scope"):
+        caveats.append(f"tested: {prov['test_scope']}")
     md.append(f"| Thresholds | v{run_meta.get('thresholds_version')} "
-              f"(calibrated: {run_meta.get('thresholds_calibrated')}) |")
+              f"(calibrated: {run_meta.get('thresholds_calibrated')})"
+              + (" · " + " · ".join(caveats) if caveats else "") + " |")
     md.append("")
 
     if skipped_rows:

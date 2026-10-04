@@ -138,7 +138,7 @@ def _synthetic_clip(path: Path, width: int, height: int, fps: float,
     return path
 
 
-def fingerprint(config_path: str | Path) -> dict:
+def fingerprint(config_path: str | Path, pipeline_path: str | Path | None = None) -> dict:
     """What a doctor snapshot vouches for. The runner refuses a snapshot whose
     fingerprint differs from the current setup (a passing doctor for last week's
     workflow or judge must not open tonight's gate)."""
@@ -157,7 +157,10 @@ def fingerprint(config_path: str | Path) -> dict:
     return {"config_sha256": sha256_file(p),
             "workflow_sha256": sha256_file(wf) if wf else None,
             "comfy_host": comfy.get("host"),
-            "judge": f"{judge.get('adapter', 'ollama')}/{judge.get('model')}"}
+            "judge": f"{judge.get('adapter', 'ollama')}/{judge.get('model')}",
+            # the policies doctor measured against (judge timeout/retries, VRAM
+            # thresholds): editing them after doctor makes the snapshot stale
+            "pipeline_sha256": sha256_file(pipeline_path) if pipeline_path else None}
 
 
 class Doctor:
@@ -769,10 +772,21 @@ def _run_checks(doc: Doctor, cfg_file: Path, pipe_file: Path, thr_file: Path,
     pol = _load_policies(doc, pipe_file)
     _guard(doc, "binaries", _check_binaries, doc)
     if cfg is not None:
-        client = _guard(doc, "comfy", _check_comfy, doc, cfg, pol)
-        ready = _guard(doc, "vram.handoff", _handoff_to_judge, doc, client, pol,
-                       do_free, default=False)
-        _guard(doc, "judge", _check_judge, doc, cfg, pol, client, ready, do_free)
+        from . import lock
+        try:      # doctor frees VRAM and loads the VLM: never beside a running night
+            held = lock.acquire(lock.runs_base(cfg))
+        except lock.LockHeld as e:
+            doc.add("gpu.lock", False, f"another shortsloop process holds {e} — GPU "
+                                       f"checks not run (re-run doctor when it ends)")
+            held = None
+        if held is not None:
+            try:
+                client = _guard(doc, "comfy", _check_comfy, doc, cfg, pol)
+                ready = _guard(doc, "vram.handoff", _handoff_to_judge, doc, client,
+                               pol, do_free, default=False)
+                _guard(doc, "judge", _check_judge, doc, cfg, pol, client, ready, do_free)
+            finally:
+                lock.release(held)
         _guard(doc, "rewrite", _check_rewrite, doc, cfg)
     _guard(doc, "disk", _check_disk, doc, cfg or {}, pol)
     _guard(doc, "thresholds", _check_thresholds, doc, thr_file)
@@ -819,7 +833,7 @@ def run_doctor(config_path: str, pipeline_path: str, thresholds_path: str,
     finally:
         ok = doc.ok and status == "complete"
         try:
-            fp = fingerprint(cfg_file)
+            fp = fingerprint(cfg_file, Path(pipeline_path))
         except Exception as e:  # noqa: BLE001
             fp, ok = {"error": str(e)}, False
         try:

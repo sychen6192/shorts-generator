@@ -668,3 +668,21 @@ def test_binaries_record_absolute_paths_and_cron_hint(tmp_path, capsys):
         assert snap["tools"][binary] == where
     out = capsys.readouterr().out
     assert "cron" in out and "PATH=" in out
+
+
+def test_doctor_does_not_touch_the_gpu_while_a_run_holds_the_lock(clips, tmp_path):
+    import fcntl
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        cfg = _cfg(tmp_path, comfy.host, jurl)
+        runs = Path(yaml.safe_load(cfg.read_text())["paths"]["runs_dir"])
+        runs.mkdir(parents=True, exist_ok=True)
+        with open(runs / ".shortsloop.lock", "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code = run_doctor(str(cfg), str(tmp_path / "pipeline.yaml"),
+                              str(tmp_path / "thresholds.yaml"), do_free=True,
+                              out_path=None)
+        snap = json.loads((tmp_path / "doctor.json").read_text(encoding="utf-8"))
+    assert code != 0 and snap["ok"] is False
+    assert comfy.free_calls == 0 and judge.chat_calls == 0
+    assert any(c["name"] == "gpu.lock" and c["level"] == "FAIL" for c in snap["checks"])

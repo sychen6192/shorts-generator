@@ -194,7 +194,9 @@ provenance:
   test_false_pass: null      # "k/n labeled-fail test clips would ship (…%, 95% CI …)"
   # amended 2026-10-04 (tuner provenance, additive): test_false_fail, test_scope
   # (L1-only | L1+L2), judge {model, model_digest}, l1_impl, inputs_sha256
-  # {batch_manifest, l2_scores}, values_sha256, approved_at
+  # {batch_manifest, l2_scores}, values_sha256, approved_at, l2_floors_fallback,
+  # l2_untested_accepted. The runner enforces judge (model refuse / build halt) and
+  # l1_impl (refuse) at run time and prints the caveats in the morning report.
 l1:
   motion:     {metric: flow_mag_median,      op: ">=", value: PLACEHOLDER}
   freeze:     {metric: freeze_longest_run_s, op: "<=", value: PLACEHOLDER}
@@ -308,7 +310,7 @@ policies:
   waves_max: 3                      # = max_attempts
   comfy: {timeout_s: 1800, poll_s: 5, one_job_at_a_time: true}
   judge: {timeout_s: 300, retries: 1, infra_escalation_after: 2}
-  vram_handoff: {free_min_gb: 24, wait_timeout_s: 180}
+  vram_handoff: {free_min_gb: 24, wait_timeout_s: 180}   # + optional gen_free_min_gb
 resources:
   comfy_host: ${COMFY_HOST}
   workflow_t2v: config              # resolved from config.yaml
@@ -384,8 +386,14 @@ Generation → judge (`gpu.to_judge`):
 
 Judge → generation (`gpu.to_generation`, *amended 2026-10-04 — the old step 4 only
 assumed this*), before the first submission of EVERY generation wave including
-wave 1: unload judge + rewrite models, `/free`, poll until free ≥ `free_min_gb` →
-on timeout **infra halt** before Wan loads beside a resident model.
+wave 1: wait for an empty ComfyUI queue (its /free is deferred behind a running
+job), unload judge + rewrite models, `/free`, poll until free ≥
+`vram_handoff.gen_free_min_gb` (optional; default `free_min_gb`) → on timeout
+**infra halt** before Wan loads beside a resident model. A resident 8B VLM can leave
+more than the judge's own floor free on a 32 GB card, so doctor measures free VRAM
+with the VLM loaded and after unloading, FAILs when the generation threshold cannot
+tell them apart, and recommends a value between them. An openai_compat judge needs
+`judge.unload_url` (refused otherwise).
 
 Hard rule 4 from the outside (`comfy.py`): the queue must be empty before every
 submit; after any failed wait our job is interrupted (only if running) or deleted

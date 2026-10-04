@@ -235,7 +235,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 ```
 
 Only one runner per runs directory: a second invocation (or an overlapping
-`--resume`) refuses with exit 2 while the first holds `runs/.shortsloop.lock`.
+`--resume`) refuses with exit 2 while the first holds `runs/.shortsloop.lock`; the
+same lock is taken by `calibrate-batch`, `calibrate-tune --with-l2` and doctor's GPU
+checks, so they can never share the card with a night.
 
 Morning workflow: open `runs/<run_id>/report.md` → review contact sheets and
 reasons → layer audio per the dispatch sheet's 音檔需求 table and re-encode with
@@ -256,7 +258,7 @@ refused.
 | `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: judge down, VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts), ComfyUI queue busy or a stuck job that won't clear, 3 consecutive generation failures, 2 consecutive judge errors, checker contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix, then `--resume`. |
 | Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
-| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without an unload hook the next Wan wave halts on the VRAM check, by design. When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
+| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without one, `run`, `calibrate-*` refuse at start and doctor FAILs, because the VLM could not be evicted before a Wan wave (hard rule 3). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
 | OOM during generation | Runner already `/free`s and re-rolls; if chronic, drop to 480x832 or 81 frames in the dispatch sheet. |
 | Report shows `encode failed after PASS` | Clip passed QC but the encode failed verification (size/fps/codec/aac/silence) or the clip bytes no longer match the verdict — nothing was left in `encoded/`; the raw file is kept in `runs/<id>/clips/`. |
 | `run` refuses: thresholds calibrated with another judge / halts: judge build differs | L2 floors are tuned to one judge model and build (`thresholds.yaml` provenance.judge). Re-pull that build, or re-run Phase 0 (`calibrate-tune --with-l2`, then `--approve`) for the new judge. |
@@ -270,7 +272,8 @@ refused.
       the judge->generation handoff sees the VLM gone (`generate ok layer=vram_handoff`
       events in events.jsonl show the measured free VRAM)
 - [ ] handoff thresholds suit the card: `vram_handoff.free_min_gb` (24) must leave
-      the judge room; set `vram_handoff.gen_free_min_gb` so an idle card clears it but
+      the judge room; set `vram_handoff.gen_free_min_gb` (doctor prints both
+      readings and a recommended value) so an idle card clears it but
       one with the VLM still loaded (`ollama ps`) does not — otherwise the
       judge->generation check cannot tell them apart
 - [ ] real Wan clip L1 metrics look sane vs fixtures (`shortsloop check --l1-only` on one)
