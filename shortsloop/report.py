@@ -66,10 +66,11 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
         md.append(f"> ⛔ **{status}** — {run_meta.get('halt_reason', '')}")
         md.append("> Nothing was generated or judged after the halt point. Clips that "
                   "PASSED before it were still encoded (marked below); unfinished clips "
-                  f"continue with `shortsloop run --dispatch {run_dir / 'dispatch.md'} "
-                  f"--resume {run_dir}` once the cause is fixed.")
+                  f"continue with `{run_meta.get('resume_command') or ('shortsloop run --dispatch ' + str(run_dir / 'dispatch.md') + ' --resume ' + str(run_dir))}` "
+                  f"once the cause is fixed.")
         md.append("")
-    if run_meta.get("allow_uncalibrated") and not run_meta.get("thresholds_calibrated"):
+    if run_meta.get("allow_uncalibrated") and not run_meta.get(
+            "ship_calibrated", run_meta.get("thresholds_calibrated")):
         md.append("> ⚠️ **UNCALIBRATED supervised run** — thresholds are not signed off "
                   "(Phase 0). PASS clips were encoded to `encoded_uncalibrated/` and are "
                   "NOT shippable.")

@@ -29,7 +29,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/tags":
             self._json({"models": [{"name": self.server.model,
-                                    "digest": "sha256:fakedigest"}]})
+                                    "digest": self.server.digest}]})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -81,6 +81,7 @@ class FakeOllama(ThreadingHTTPServer):
         self.chat_calls = 0
         self.chat_times: list[float] = []
         self.generate_calls = 0
+        self.digest = "sha256:fakedigest"
         self.generate_times: list[float] = []
         self.unloaded_models: list[str] = []
         self.rewrite_times: list[float] = []

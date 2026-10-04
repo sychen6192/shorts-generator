@@ -55,7 +55,42 @@ def load_policies(pipeline_path: str | Path | None) -> dict:
             pol[key].update(val)
         else:
             pol[key] = val
+    problems = _policy_problems(pol)
+    if problems:
+        raise InfraError("l1", f"pipeline file {p}: " + "; ".join(problems))
     return pol
+
+
+def _num(v) -> bool:
+    return type(v) in (int, float)
+
+
+def _policy_problems(pol: dict) -> list[str]:
+    """Types and ranges the runner relies on — a mistyped value must refuse at
+    22:00, not crash the night with a TypeError and no report."""
+    errs = []
+
+    def need(path, ok, what):
+        cur = pol
+        for k in path.split("."):
+            cur = cur.get(k) if isinstance(cur, dict) else None
+        if not ok(cur):
+            errs.append(f"policies.{path} must be {what}, got {cur!r}")
+    pos_int = (lambda v: type(v) is int and v >= 1, "an integer >= 1")
+    pos_num = (lambda v: _num(v) and v > 0, "a number > 0")
+    nonneg = (lambda v: _num(v) and v >= 0, "a number >= 0")
+    for path, (ok, what) in {
+        "max_attempts_per_clip": pos_int, "waves_max": pos_int,
+        "wall_clock_budget_h": pos_num, "disk_min_free_gb": nonneg,
+        "comfy.timeout_s": pos_num, "comfy.poll_s": pos_num,
+        "judge.timeout_s": pos_num, "judge.infra_escalation_after": pos_int,
+        "judge.retries": (lambda v: type(v) is int and v >= 0, "an integer >= 0"),
+        "vram_handoff.free_min_gb": pos_num, "vram_handoff.wait_timeout_s": nonneg,
+    }.items():
+        need(path, ok, what)
+    if "gen_free_min_gb" in (pol.get("vram_handoff") or {}):
+        need("vram_handoff.gen_free_min_gb", *pos_num)
+    return errs
 
 
 def effective_judge_cfg(cfg: dict, pol: dict) -> dict:

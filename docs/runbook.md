@@ -186,12 +186,13 @@ does; a malformed `policies:` block is a refusal (exit 2).
 #
 #     Supervised exception, not the normal path — sign off an L1-only proposal:
 .venv/bin/shortsloop calibrate-tune --approve --accept-untested-l2
-#     Opens the gate with untuned default L2 floors and L1-only test numbers.
-#     It leaves a loud marker: provenance.test_scope stays "L1 only — …" and
-#     approve records provenance.l2_untested_accepted: true. It is a record,
-#     not a guard: the runner does not re-check it, so use it only when you
-#     will supervise the nights, and replace it with a judge-backed sign-off
-#     (2c + 2d) as soon as the judge works.
+#     Writes untuned default L2 floors with L1-only test numbers and a loud
+#     marker: provenance.test_scope stays "L1 only — …" and approve records
+#     provenance.l2_untested_accepted: true. The runner enforces it: such
+#     thresholds count as UNCALIBRATED — `run` refuses without
+#     --allow-uncalibrated, and supervised PASS clips go to
+#     encoded_uncalibrated/, never encoded/. Replace it with a judge-backed
+#     sign-off (2c + 2d) before any unattended night.
 ```
 
 Until 2d, `shortsloop run` refuses to start without `--allow-uncalibrated`.
@@ -258,7 +259,7 @@ refused.
 | `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: judge down, VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts), ComfyUI queue busy or a stuck job that won't clear, 3 consecutive generation failures, 2 consecutive judge errors, checker contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix, then `--resume`. |
 | Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
-| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without one, `run`, `calibrate-*` refuse at start and doctor FAILs, because the VLM could not be evicted before a Wan wave (hard rule 3). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
+| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without one, `run`, `calibrate-batch` and `calibrate-tune --with-l2` refuse at start and doctor FAILs, because the VLM could not be evicted before a Wan wave (hard rule 3). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
 | OOM during generation | Runner already `/free`s and re-rolls; if chronic, drop to 480x832 or 81 frames in the dispatch sheet. |
 | Report shows `encode failed after PASS` | Clip passed QC but the encode failed verification (size/fps/codec/aac/silence) or the clip bytes no longer match the verdict — nothing was left in `encoded/`; the raw file is kept in `runs/<id>/clips/`. |
 | `run` refuses: thresholds calibrated with another judge / halts: judge build differs | L2 floors are tuned to one judge model and build (`thresholds.yaml` provenance.judge). Re-pull that build, or re-run Phase 0 (`calibrate-tune --with-l2`, then `--approve`) for the new judge. |

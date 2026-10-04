@@ -190,6 +190,11 @@ class Runner:
             return self._refuse(str(e))
         self.thresholds_provenance = _thr.get("provenance") or {}
         self.thresholds_calibrated = thr_info["calibrated"]
+        self.l2_untested = bool(self.thresholds_provenance.get("l2_untested_accepted"))
+        if self.thresholds_calibrated and self.l2_untested and not self.allow_uncalibrated:
+            return self._refuse(
+                "thresholds were approved with UNTESTED L2 floors (--accept-untested-l2): "
+                "the judge is not calibrated — supervised runs only (--allow-uncalibrated)")
         tuned_l1 = self.thresholds_provenance.get("l1_impl")
         if self.thresholds_calibrated and tuned_l1 and tuned_l1 != impl_fingerprint():
             return self._refuse(
@@ -286,9 +291,8 @@ class Runner:
 
     def _acquire_lock(self) -> int | None:
         """One GPU user per runs dir (shortsloop/lock.py) — hard rule 4 starts here."""
-        base = self.resume_dir.parent if self.resume_dir else self._runs_base()
-        try:
-            self._lock = lock.acquire(base)
+        try:   # the SAME file doctor and calibration take, whatever --runs-dir says
+            self._lock = lock.acquire(lock.runs_base(self.cfg))
         except lock.LockHeld as e:
             return self._refuse(f"another shortsloop process holds {e}")
         return None
@@ -420,6 +424,8 @@ class Runner:
                                     "verdict_path": st.verdict_path}
             elif st.recover:
                 self._restore_interrupted(item, st.recover)
+            elif item.attempts_used >= self.pol["max_attempts_per_clip"]:
+                item.status = "failed_final"       # nothing left to plan (or skip)
             elif item.attempts_used > 0:
                 # last attempt ended in a final FAIL/ERROR before the crash: re-plan
                 # its re-roll exactly as the live run would have (plan §2.3) — but
@@ -621,7 +627,10 @@ class Runner:
         if plan["steps"] == 8 and self.base_steps != STEPS8_BASE:
             plan["steps"] = None             # steps8 is defined for the 4-step build
             plan["action"] += f" (steps8 n/a: workflow runs {self.base_steps} steps)"
-        if plan["wants_rewrite"]:
+        if plan["wants_rewrite"] and item.rewritten:
+            plan["prompt"] = item.prompt_current     # one rewrite ever (plan §2.3)
+            plan["action"] = "rewrite (kept: made before a resume)"
+        elif plan["wants_rewrite"]:
             got = rewrite_prompt(item.prompt_current, judge_reason, self.rewrite_cfg,
                                  anchors=item.spec.anchors)
             if got["ok"]:
@@ -670,11 +679,19 @@ class Runner:
                 self._finish_generation(item, n, resume.get("seed"),
                                         resume["prompt_used"], resume.get("steps"),
                                         resume.get("prompt_id"), **common)
-        # 2) re-roll plans deferred by --resume (may call the rewrite LLM)
-        for item in self.items:
+        # 2) re-roll plans deferred by --resume. A rewrite loads a text LLM: Wan
+        #    (just used by a re-attached job, or cached from before the crash) goes
+        #    out first, verified (hard rule 3); the next generation handoff evicts
+        #    the LLM again before Wan returns.
+        replans = [i for i in self.items if i.replan and i.status == "pending"]
+        if any(plan_reroll(i.replan[0], i.attempts_used + 1, i.prompt_current)
+               ["wants_rewrite"] and not i.rewritten for i in replans):
+            vh = self.pol["vram_handoff"]
+            gpu.to_judge(self.comfy, vh["free_min_gb"], vh["wait_timeout_s"])
+            self._gen_ready = False
+        for item in replans:
             replan, item.replan = item.replan, None
-            if replan and item.status == "pending":
-                self._schedule_reroll(item, *replan)
+            self._schedule_reroll(item, *replan)
         # 3) new attempts, one job at a time
         for item in self.items:
             while item.status == "pending":
@@ -860,6 +877,7 @@ class Runner:
                        count=len(awaiting), wave=self.waves_run)
         vh = self.pol["vram_handoff"]
         self._gen_ready = False
+        self._judge_digest = None          # re-read every wave: builds can change
         try:
             free_gb = gpu.to_judge(self.comfy, vh["free_min_gb"], vh["wait_timeout_s"])
             self.log.event("verify", "ok", None, None, layer="vram_handoff",
@@ -916,6 +934,13 @@ class Runner:
                         f"errors — escalating to infrastructure failure (fail closed)")
                 continue
             self.consecutive_judge_errors = 0
+            want = (self.calibrated_judge or {}).get("model_digest")
+            if code == 0 and self.thresholds_calibrated and want and \
+                    (verdict.get("l2") or {}).get("model_digest") != want:
+                raise RunHalted(
+                    f"{cid} was judged by build {verdict['l2'].get('model_digest')}, not "
+                    f"the calibrated {want} — judge changed during the run; nothing "
+                    f"judged by it ships")
             if code == 0:
                 ok, why = self._gate(verdict)
                 if not ok:
@@ -971,7 +996,8 @@ class Runner:
                 if sha256_file(clip) != (verdict.get("clip") or {}).get("sha256"):
                     raise EncodeFailed(f"clip sha256 differs from the one its PASS "
                                        f"verdict judged — not shipped")
-                shippable = (verdict.get("thresholds") or {}).get("calibrated") is True
+                shippable = ((verdict.get("thresholds") or {}).get("calibrated") is True
+                             and not self.l2_untested)
                 folder = "encoded" if shippable else "encoded_uncalibrated"
                 out = self.run_dir / folder / f"{cid}.mp4"
                 encode_silent(clip, out)
@@ -983,6 +1009,17 @@ class Runner:
         if refused:
             raise RunHalted("ship-gate refused PASS verdict(s) at persist — checker/"
                             "runner mismatch: " + "; ".join(refused))
+
+    def _resume_command(self) -> str:
+        """The exact command that resumes THIS run with its own settings."""
+        parts = ["shortsloop", "run", "--dispatch", self.run_dir / "dispatch.md",
+                 "--resume", self.run_dir, "--config", self.config_path,
+                 "--pipeline", self.pipeline_path, "--thresholds", self.thresholds_path]
+        if self.allow_uncalibrated:
+            parts.append("--allow-uncalibrated")
+        if self.skip_doctor:
+            parts.append("--skip-doctor")
+        return " ".join(_quote(p) if isinstance(p, Path) else p for p in parts)
 
     def _halt(self, status: str, reason: str) -> str:
         """Stop cleanly: log the halt, give every generated-but-unjudged attempt
@@ -1042,7 +1079,24 @@ class Runner:
         finally:
             self._release_lock()
 
+    def _check_judge_build(self) -> int | None:
+        want = (self.calibrated_judge or {}).get("model_digest")
+        if not (self.thresholds_calibrated and want):
+            return None
+        try:
+            have = self._current_judge_digest()   # /api/tags or /v1/models: no VRAM
+        except InfraError as e:
+            return self._refuse(f"cannot identify the judge build: {e.message}")
+        if have != want:
+            return self._refuse(f"judge build {have} differs from the build the "
+                                f"thresholds were calibrated with ({want}) — re-pull the "
+                                f"calibrated model or re-run Phase 0")
+        return None
+
     def _run_locked(self) -> int:
+        refusal = self._check_judge_build()
+        if refusal is not None:
+            return refusal
         self._init_run_dir()
         self._t_start = self.clock()
 
@@ -1106,6 +1160,8 @@ class Runner:
                                       ("test_scope", "l2_untested_accepted",
                                        "l2_floors_fallback", "judge")},
             "allow_uncalibrated": self.allow_uncalibrated,
+            "ship_calibrated": self.thresholds_calibrated and not self.l2_untested,
+            "resume_command": self._resume_command(),
             "gen_params": self.gen_params,
             "gen_fallback": self.gen_fallback,
             "base_steps": self.base_steps,
@@ -1117,6 +1173,11 @@ class Runner:
         print(f"[shortsloop] {status}: {passed}/{len(self.items)} clips passed · "
               f"report: {self.run_dir / 'report.md'}")
         return 0 if status.startswith("COMPLETED") else 3
+
+
+def _quote(p) -> str:
+    import shlex
+    return shlex.quote(str(p))
 
 
 def main_run(argv: list[str] | None = None) -> int:

@@ -191,9 +191,8 @@ def test_judge_build_differs_from_calibration_halts_before_judging(clips, tmp_pa
         env = make_env(tmp_path, comfy, jurl)
         _with_provenance_judge(env, "ollama/qwen3-vl:8b-instruct", "sha256:otherbuild")
         runner = make_runner(small_sheet(tmp_path), env)
-        assert runner.run() == 3
-        assert judge.chat_calls == 0
-        assert "calibrat" in run_report(runner)["run"]["halt_reason"]
+        assert runner.run() == 2            # second review: refused before any GPU work
+        assert judge.chat_calls == 0 and comfy.submissions == []
 
 
 def test_openai_compat_judge_without_unload_hook_refuses(clips, tmp_path):
@@ -217,9 +216,10 @@ def test_judge_and_rewrite_unloaded_after_the_wave_before_the_next_generation(cl
         assert runner.run() == 0
         wave1_end = judge.rewrite_times[0]          # rewrite runs at the end of wave 1
         wave2_start = comfy.submit_times[1]
-        between = [t for t in judge.generate_times if wave1_end < t < wave2_start]
-        assert between, "no unload between the judge wave and the next Wan job"
-        assert {"qwen3-vl:8b-instruct", "fake-text-model"} <= set(judge.unloaded_models)
+        between = {m for t, m in zip(judge.generate_times, judge.unloaded_models)
+                   if wave1_end < t < wave2_start}
+        assert {"qwen3-vl:8b-instruct", "fake-text-model"} <= between, \
+            "judge and rewrite model must both be evicted before the next Wan job"
 
 
 def test_busy_queue_is_never_joined(clips, tmp_path):
@@ -377,7 +377,164 @@ def test_report_shows_calibration_caveats(clips, tmp_path):
                              "l2_untested_accepted": True,
                              "l2_floors_fallback": {"note": "least-bad floors"}}
         env["thresholds"].write_text(yaml.safe_dump(thr))
-        runner = make_runner(small_sheet(tmp_path), env)
-        assert runner.run() == 0
+        runner = make_runner(small_sheet(tmp_path), env, allow_uncalibrated=True)
+        assert runner.run() == 0            # untested L2 floors: supervised runs only
         md = (runner.run_dir / "report.md").read_text()
-        assert "L2 floors untested" in md and "fallback" in md
+        assert "L2 floors untested" in md and "fallback" in md and "UNCALIBRATED" in md
+
+
+# ------------------------------------------------------------ second review pass
+
+def test_judge_rebuilt_between_waves_never_ships(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, \
+         serve_judge(scores_queue=[DEFORMED, GOOD_SCORES]) as (judge, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        _with_provenance_judge(env, "ollama/qwen3-vl:8b-instruct", "sha256:fakedigest")
+        runner = make_runner(small_sheet(tmp_path), env)
+        real = runner._judge_phase
+
+        def repull_after_first_wave():
+            real()
+            judge.digest = "sha256:REPULLED"
+        runner._judge_phase = repull_after_first_wave
+        assert runner.run() == 3
+        assert encoded(runner.run_dir) == []
+
+
+def test_judge_build_mismatch_refuses_before_any_generation(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (judge, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        _with_provenance_judge(env, "ollama/qwen3-vl:8b-instruct", "sha256:otherbuild")
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+        assert comfy.submissions == [] and judge.chat_calls == 0
+
+
+def test_resume_after_the_last_wave_keeps_failed_final(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips) as comfy, \
+         serve_judge(scores=DEFORMED) as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        first = make_runner(small_sheet(tmp_path), env)
+        assert first.run() == 0
+        assert run_report(first)["clips"][0]["status"] == "failed_final"
+        again = make_runner(small_sheet(tmp_path), env, resume_dir=first.run_dir)
+        assert again.run() == 0
+        assert run_report(again)["clips"][0]["status"] == "failed_final"
+
+
+def test_resume_frees_wan_before_a_deferred_rewrite(clips, tmp_path):
+    pre = {"pre-v1c2": {"scenario": {"fixture": "moving"}, "polls": 0, "done": False,
+                        "info": {}, "order": 0}}
+    with serve_comfy(fixture_paths=clips, preloaded_jobs=pre) as comfy, \
+         serve_judge(scores_queue=[GOOD_SCORES, GOOD_SCORES]) as (judge, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        dispatch = small_sheet(tmp_path, n_clips=2)
+        run_dir, log = _forge(env, dispatch)
+        log.attempt({"clip_id": "V1C1", "attempt": 1, "seed": 1, "prompt_text": PROMPT1,
+                     "prompt_base": PROMPT1, "status": "l2_failed", "verdict": "FAIL",
+                     "failure_classes": ["off_prompt"], "steps": None,
+                     "verdict_path": None})
+        (run_dir / "prompts" / "V1C2_a1.txt").write_text(
+            PROMPT1.replace("number 1", "number 2") + "\n")
+        log.event("generate", "submitted", "V1C2", 1, prompt_id="pre-v1c2", seed=5)
+        assert make_runner(dispatch, env, resume_dir=run_dir).run() == 0
+        done = comfy.jobs["pre-v1c2"]["done_at"]
+        rewrite = judge.rewrite_times[0]
+        assert any(done < t < rewrite for t in comfy.free_times)   # Wan out first
+
+
+def test_rewrite_made_before_a_halt_is_not_redone(clips, tmp_path, monkeypatch):
+    real_submit = comfy_mod.ComfyClient.submit
+    calls = {"n": 0}
+
+    def flaky_submit(self, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise InfraError("l1", "ComfyUI briefly unreachable")
+        return real_submit(self, **kw)
+    monkeypatch.setattr(comfy_mod.ComfyClient, "submit", flaky_submit)
+    with serve_comfy(fixture_paths=clips) as comfy, \
+         serve_judge(scores_queue=[OFF_PROMPT, GOOD_SCORES]) as (judge, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        first = make_runner(small_sheet(tmp_path), env)
+        assert first.run() == 3
+        assert judge.rewrite_calls == 1
+        again = make_runner(small_sheet(tmp_path), env, resume_dir=first.run_dir)
+        assert again.run() == 0
+        assert judge.rewrite_calls == 1                          # one rewrite, ever
+        a2 = last_lines(first.run_dir)[("V1C1", 2)]
+        assert a2["prompt_rewritten"] is True and a2["prompt_diff"]
+
+
+def test_runner_takes_the_same_lock_as_doctor_and_calibration(clips, tmp_path):
+    import fcntl
+    from shortsloop import lock
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        cfg = yaml.safe_load(env["config"].read_text())
+        base = lock.runs_base(cfg)
+        base.mkdir(parents=True, exist_ok=True)
+        other = tmp_path / "elsewhere"
+        with open(base / lock.LOCK_NAME, "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r = Runner(dispatch_path=small_sheet(tmp_path), config_path=env["config"],
+                       pipeline_path=env["pipeline"], thresholds_path=env["thresholds"],
+                       runs_dir=other)
+            assert r.run() == 2
+        assert comfy.submissions == []
+
+
+@pytest.mark.parametrize("bad", [
+    {"wall_clock_budget_h": "6h"}, {"max_attempts_per_clip": 2.5},
+    {"judge": {"retries": True}}, {"vram_handoff": {"free_min_gb": "24"}},
+    {"comfy": {"timeout_s": -5}}, {"disk_min_free_gb": None},
+])
+def test_mistyped_policies_are_refused_up_front(tmp_path, bad):
+    from shortsloop.settings import load_policies
+    p = tmp_path / "pipeline.yaml"
+    p.write_text(yaml.safe_dump({"policies": bad}))
+    with pytest.raises(InfraError):
+        load_policies(p)
+
+
+def test_busy_queue_still_unloads_the_judge_first(clips):
+    from shortsloop import gpu
+    from shortsloop.comfy import ComfyClient
+    pre = {"foreign": {"scenario": {"hang": True}, "polls": 0, "done": False,
+                       "info": {}, "order": 0}}
+    with serve_comfy(fixture_paths=clips, preloaded_jobs=pre) as comfy, \
+         serve_judge() as (judge, jurl):
+        c = ComfyClient(host=comfy.host, workflow="w")
+        with pytest.raises(InfraError, match="queue busy"):
+            gpu.to_generation(c, {"adapter": "ollama", "base_url": jurl,
+                                  "model": "qwen3-vl:8b-instruct"}, None, 20, 0,
+                              sleep=lambda s: None)
+        assert judge.generate_calls == 1                         # VLM evicted anyway
+        with pytest.raises(InfraError, match="queue busy"):
+            gpu.to_judge(c, 20, 0, sleep=lambda s: None)        # not "Wan did not unload"
+
+
+def test_halted_report_resume_command_keeps_the_run_flags(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips, never_frees=True) as comfy, \
+         serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl, calibrated=False)
+        runner = make_runner(small_sheet(tmp_path), env, allow_uncalibrated=True)
+        assert runner.run() == 3
+        md = (runner.run_dir / "report.md").read_text()
+        for flag in ("--allow-uncalibrated", f"--config {env['config']}",
+                     f"--pipeline {env['pipeline']}", f"--thresholds {env['thresholds']}"):
+            assert flag in md, flag
+
+
+def test_untested_l2_thresholds_never_ship_unattended(clips, tmp_path):
+    from shortsloop.l1 import impl_fingerprint
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (_, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        thr = yaml.safe_load(env["thresholds"].read_text())
+        thr["provenance"] = {"l1_impl": impl_fingerprint(), "l2_untested_accepted": True}
+        env["thresholds"].write_text(yaml.safe_dump(thr))
+        assert make_runner(small_sheet(tmp_path), env).run() == 2
+        sup = make_runner(small_sheet(tmp_path), env, allow_uncalibrated=True)
+        assert sup.run() == 0
+        assert encoded(sup.run_dir) == []
+        assert sorted(p.name for p in (sup.run_dir / "encoded_uncalibrated").glob("*")) \
+            == ["V1C1.mp4"]

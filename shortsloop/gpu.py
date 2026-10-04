@@ -67,7 +67,9 @@ def gen_free_min_gb(handoff_policy: dict) -> float:
 
 def to_judge(comfy, free_min_gb: float, wait_timeout_s: float,
              sleep=time.sleep) -> float:
-    """Generation -> judge: Wan out (/free), verified free VRAM."""
+    """Generation -> judge: Wan out (/free), verified free VRAM. A busy queue is
+    reported as such (its /free would be deferred), not as 'Wan did not unload'."""
+    comfy.wait_queue_empty(wait_timeout_s, sleep=sleep)
     return comfy.vram_handoff(free_min_gb, wait_timeout_s, sleep=sleep)
 
 
@@ -77,10 +79,11 @@ def to_generation(comfy, judge_cfg: dict | None, rewrite_cfg: dict | None,
     """Judge -> generation (and before any first generation): unload the VLM and
     the rewrite LLM, /free ComfyUI's caches, then VERIFY the GPU is empty enough
     that Wan never shares VRAM with a resident language model."""
-    # A busy queue first: real ComfyUI defers /free until the running job ends, so
-    # a VRAM timeout here would wrongly blame the (already unloaded) judge.
-    comfy.wait_queue_empty(wait_timeout_s, sleep=sleep)
+    # Evict the LLMs first — that never depends on ComfyUI. Then the queue: real
+    # ComfyUI defers /free until a running job ends, so a VRAM timeout would
+    # otherwise wrongly blame the (already unloaded) judge.
     notes = unload_llms(judge_cfg, rewrite_cfg)
+    comfy.wait_queue_empty(wait_timeout_s, sleep=sleep)
     comfy.free()
     try:
         free = comfy.vram_wait(free_min_gb, wait_timeout_s, "generation", sleep=sleep)

@@ -85,7 +85,13 @@ shortsloop-check CLIP.mp4 --prompt-file PROMPT.txt --json VERDICT.json
   `encoded_uncalibrated/` (never `encoded/`), and persist re-checks that the clip's
   bytes still hash to the verdict's `clip.sha256`. The nightly judge must be the one
   the thresholds were calibrated with (`provenance.judge`): another model refuses
-  at start, another build of the same model halts before the first judge call.
+  at start; another build of the same model is refused at start (one /api/tags or
+  /v1/models call, no VRAM) and, re-read every judge wave plus compared against each
+  verdict's `l2.model_digest`, halts the run if the build changes mid-night — nothing
+  judged by an uncalibrated build ships. Thresholds approved with
+  `--accept-untested-l2` (L2 floors never tested against labels) count as
+  uncalibrated for the unattended gate and the ship gate: supervised
+  `--allow-uncalibrated` runs only, PASS clips to `encoded_uncalibrated/`.
 - Judge replies (*amended 2026-10-04*): the reply must BE the five-dimension JSON
   object, optionally after one complete `<think>…</think>` block and inside one
   ``` fence; unterminated reasoning, prose around the object, or a truncated reply
@@ -318,6 +324,8 @@ resources:
 ```
 
 v1's runner interprets this file; a workflow engine later binds the same stage names.
+Policy values are type-checked (counts integers ≥ 1, times/sizes positive numbers,
+retries an integer ≥ 0): a mistyped value refuses the run instead of crashing it.
 *Amended 2026-10-04:* `judge.timeout_s` / `judge.retries` are authoritative for the
 nightly checker (written into `config.snapshot.yaml`); the judge-error escalation
 counter spans waves; 3 consecutive generation failures across the run are an infra

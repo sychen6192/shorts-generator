@@ -170,7 +170,8 @@ def fold(log: RunLog) -> dict[str, ClipState]:
                 s.rewritten = True
             if rec.get("prompt_diff"):
                 s.rewrite_diff = rec["prompt_diff"]
-        base = gen.get((cid, s.attempts_used), {}).get("base")
+        base = (gen.get((cid, s.attempts_used + 1), {}).get("base")
+                or gen.get((cid, s.attempts_used), {}).get("base"))
         if base:   # claimed after the last attempt line: its base is the newest
             s.prompt_current = base["prompt_base"] or s.prompt_current
             s.rewritten = s.rewritten or base["rewritten"]
