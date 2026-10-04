@@ -33,15 +33,50 @@ GGUF + mmproj pair. No code changes.
 .venv/bin/shortsloop doctor
 ```
 
-Verifies: ffmpeg/ffprobe · ComfyUI reachable, VRAM, queue · workflow is
-API-format and its model files exist **on the server** · `/free` actually frees
-VRAM (verified via `/system_stats`) · judge reachable, model installed, and a
-**two-image vision probe with strict JSON** (catches a judge that cannot
-actually see) · rewrite model (warning only) · disk headroom · thresholds state.
+No `config.yaml` yet? Doctor writes one there as a skeleton (a copy of
+`config.example.yaml`) and FAILs — fill it in and re-run.
 
-Writes `doctor.json` next to `config.yaml`. **The nightly runner refuses to
+Verifies, in this order:
+
+- **ffmpeg/ffprobe** — absolute paths are recorded in `doctor.json` (`tools`).
+  Cron does not inherit your shell's PATH: doctor prints the `PATH=…` line the
+  crontab needs (§4) and warns when the binaries live outside cron's default
+  `/usr/bin:/bin`.
+- **ComfyUI** reachable, a real CUDA GPU (no devices, CPU mode, or a card smaller
+  than `vram_handoff.free_min_gb` = FAIL), queue state.
+- **Workflow**: API format; a dry run (`--dump`, nothing queued) proves prompt,
+  seed, size, length and steps are patchable at the nightly 720x1280 · 81 frames ·
+  16 fps · steps 8; every model file its loader nodes reference exists **on the
+  server**. An unlistable `/models/<folder>` or an unrecognized loader class (e.g.
+  GGUF loaders) is a FAIL — doctor cannot vouch for those files.
+- **VRAM handoff**: `/free`, then free VRAM verified via `/system_stats`. Only then
+  does the judge VLM load — hard rule 3 applies to the doctor's own probes too.
+- **Judge**: reachable, model installed, a **two-call color vision probe** with
+  strict JSON (catches a judge that cannot actually see), then an **L2 dry run** —
+  the real nightly call: 8 frames of a synthetic 720x1280 clip + the rubric + the
+  strict response schema, parsed within `judge.timeout_s` (proves `num_ctx` fits 8
+  images and the model build handles them; WARN if it took over half the timeout).
+- **Judge unload**: the VLM (and rewrite LLM) are unloaded right after the probes
+  and VRAM is re-verified. A judge that cannot unload (`openai_compat` without
+  `judge.unload_url`) FAILs here instead of halting the night at the first
+  judge→generation handoff.
+- **Rewrite model** on the server the rewrite actually calls (`rewrite.base_url`,
+  else the judge's Ollama, else local Ollama) — warning only.
+- **Disk** headroom on the filesystem that will hold `paths.runs_dir` (even before
+  it exists) · pipeline policies · thresholds state.
+
+Writes `doctor.json` next to `config.yaml`. The file is overwritten with
+`ok: false` (`status: "in progress"`) the moment doctor starts; only a run that
+completes with every check green writes `ok: true`. A crash or Ctrl-C leaves
+`ok: false` — never an older green snapshot. **The nightly runner refuses to
 start without a passing snapshot** (`--skip-doctor` exists for supervised
 debugging only).
+
+Anything doctor *could not verify* that the nightly depends on is a FAIL, not a
+warning. `--no-free` (debugging only) skips `POST /free`, so the handoff stays
+unverified and the snapshot is written `ok: false` — the runner refuses it. The
+judge probes then run only if the GPU is already free (the VLM never loads beside
+Wan). Run plain `shortsloop doctor` before any unattended night.
 
 ## 2. Phase 0 — calibration (one afternoon, two hard gates)
 
