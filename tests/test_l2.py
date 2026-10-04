@@ -115,3 +115,31 @@ def test_missing_floor_is_infra_error(clips):
     with serve() as (_, url):
         with pytest.raises(InfraError):
             run_l2(clips["moving"], {"fps": 16.0}, "p", cfg(url), floors)
+
+
+@pytest.mark.parametrize("dim, bad", [
+    ("subject_consistency", {"score": 1, "na": "false", "reason": "identity drifts"}),
+    ("subject_consistency", {"score": 1, "na": 1, "reason": "identity drifts"}),
+    ("anatomy_artifacts", {"score": True, "na": False, "reason": "bool is not a score"}),
+    ("imaging_quality", {"score": "4", "na": False, "reason": "string score"}),
+    ("imaging_quality", {"score": 4.5, "na": False, "reason": "fractional score"}),
+])
+def test_type_confused_judge_output_never_passes(clips, dim, bad):
+    """Hard rule 2: schema-invalid judge content is retried then clip ERROR — a
+    truthy string `na` must not silently exclude a failing dimension."""
+    scores = {k: dict(v) for k, v in GOOD_SCORES.items()}
+    scores[dim] = bad
+    with serve(scores=scores) as (srv, url):
+        with pytest.raises(ClipError):
+            run_l2(clips["moving"], {"fps": 16.0}, "p", cfg(url), FLOORS)
+        assert srv.chat_calls == 2                      # one retry, then give up
+
+
+def test_absent_or_null_na_means_scored(clips):
+    scores = {k: dict(v) for k, v in GOOD_SCORES.items()}
+    scores["subject_consistency"] = {"score": 1, "reason": "drifts"}        # no na
+    scores["anatomy_artifacts"] = {"score": 5, "na": None, "reason": "ok"}
+    with serve(scores=scores) as (_, url):
+        block, _ = run_l2(clips["moving"], {"fps": 16.0}, "p", cfg(url), FLOORS)
+    assert block["dimensions"]["subject_consistency"]["na"] is False
+    assert block["pass"] is False

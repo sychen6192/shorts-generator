@@ -7,6 +7,8 @@ checker (hard rule 1) — this module never looks at pixels.
 
 from __future__ import annotations
 
+import re
+
 # Priority order: first match drives the re-roll action.
 CLASS_PRIORITY = ["broken", "black", "static", "deformed", "flicker", "off_prompt", "blurry"]
 
@@ -88,12 +90,17 @@ def plan_reroll(classes: list[str], next_attempt: int, current_prompt: str) -> d
     return plan
 
 
+# Sheets hard-wrap prompts (~85 cols): the tail may be split across lines.
+_TAIL_RE = re.compile(r"vertical\s+9:16\s+composition", re.I)
+
+
 def append_motion_phrase(prompt: str, attempt_index: int) -> str:
     """Insert a motion phrase (deterministic pick) before the composition tail."""
     phrase = MOTION_PHRASES[attempt_index % len(MOTION_PHRASES)]
     stripped = prompt.rstrip()
-    tail_pos = stripped.lower().rfind(COMPOSITION_TAIL)
-    if tail_pos > 0:
+    tails = list(_TAIL_RE.finditer(stripped))
+    if tails and tails[-1].start() > 0:
+        tail_pos = tails[-1].start()
         head = stripped[:tail_pos].rstrip().rstrip(",;")
         tail = stripped[tail_pos:]
         return f"{head}{phrase}, {tail}"

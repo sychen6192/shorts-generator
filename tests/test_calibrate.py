@@ -288,3 +288,41 @@ def test_wilson_ci_sane():
     assert lo == 0.0 and 0.2 < hi < 0.3        # n=12, zero events → CI up to ~24%
     lo2, hi2 = wilson(3, 12)
     assert lo2 > 0.05 and hi2 < 0.6
+
+
+def test_untuned_detectors_get_guard_rails_never_null(tmp_path):
+    """The Phase 0 slate has no flicker category: flicker/ssim_floor have no labeled
+    examples. The proposal must still be shape-valid (no `value: null` that would
+    crash every checker run after sign-off) and say UNTUNED loudly."""
+    from shortsloop.thresholds import validate_thresholds
+    rows, labels = _rows_and_labels()
+    keep = {c for c in labels if not c.startswith("f")}          # drop flicker clips
+    rows = [r for r in rows if r["clip_id"] in keep]
+    labels = {c: v for c, v in labels.items() if c in keep}
+    cal = _mk_cal(tmp_path, rows, labels)
+    assert run_tune(str(cal)) == 0
+    proposed = yaml.safe_load((cal / "thresholds.proposed.yaml").read_text())
+    assert validate_thresholds({**proposed, "calibrated": True}) == []
+    good_dips = [r["_m"]["flicker_dips"] for r in rows if labels[r["clip_id"]][0] == "pass"]
+    good_ssim = [r["_m"]["ssim_min"] for r in rows if labels[r["clip_id"]][0] == "pass"]
+    assert proposed["l1"]["flicker"]["value"] >= max(good_dips)   # never fails a pass
+    assert proposed["l1"]["ssim_floor"]["value"] <= min(good_ssim)
+    report = (cal / "tuning_report.md").read_text()
+    assert "UNTUNED" in report and "flicker" in report
+
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target)) == 0
+    load_thresholds(target)                                       # checker accepts it
+
+
+def test_approve_refuses_off_shape_proposal(tmp_path):
+    rows, labels = _rows_and_labels()
+    cal = _mk_cal(tmp_path, rows, labels)
+    assert run_tune(str(cal)) == 0
+    p = cal / "thresholds.proposed.yaml"
+    data = yaml.safe_load(p.read_text())
+    data["l1"]["flicker"]["value"] = None                # hand-edited / old tuner
+    p.write_text(yaml.safe_dump(data))
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    assert not target.exists()                          # nothing signed off

@@ -60,7 +60,7 @@ class ComfyClient:
         return None
 
     def submit(self, *, prompt: str, seed: int, width: int, height: int,
-               length: int, steps: int | None = None) -> dict:
+               length: int, fps: float | None = None, steps: int | None = None) -> dict:
         """Queue one job (returns fast). {"prompt_id", "seed"}. The submitted
         prompt_id is logged BEFORE waiting so a crash mid-generation can re-attach
         on resume. InfraError on unreachable server / rejected workflow (neither
@@ -68,6 +68,8 @@ class ComfyClient:
         args = ["submit", "-w", self.workflow, "--prompt", prompt,
                 "--seed", str(seed), "--width", str(width), "--height", str(height),
                 "--length", str(length)]
+        if fps is not None:
+            args += ["--fps", f"{fps:g}"]
         if steps is not None:
             args += ["--steps", str(steps)]
         res = self._run_client(args, timeout_s=300)

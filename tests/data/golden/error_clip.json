@@ -1,0 +1,38 @@
+{
+  "schema_version": "1",
+  "verdict": "ERROR",
+  "failure_classes": [],
+  "error": {
+    "scope": "clip",
+    "stage": "probe",
+    "message": "ffprobe failed: [mov,mp4,m4a,3gp,3g2,mj2 @ 0x56480bc8c6c0] moov atom not found\n/tmp/tmpmn9451jc/corrupt.mp4: Invalid data found when processing input"
+  },
+  "clip": {
+    "path": "runs/RUN/clips/error_clip.mp4",
+    "sha256": "ce622b6e12fef6cbb0f27a1a5a2e2cda846677c7fbd72fd8869cc0a6fa40ad20",
+    "container": null
+  },
+  "prompt": {
+    "text": "A red cube sliding across a dark slate table, slow dolly-in, vertical 9:16 composition.",
+    "sha256": "dbffdb1448f5c2b1e1d2e15a37d1bb6f86782318533f81258f32d108ccc164eb"
+  },
+  "l1": null,
+  "l2": null,
+  "thresholds": {
+    "version": "test.1",
+    "calibrated": true,
+    "file_sha256": "807f5ba8ac8114cb97b7b2ca6328ee47f982c3e4f66f407ae4c25ec895c36b41"
+  },
+  "layers_run": [],
+  "timing": {
+    "l1_s": null,
+    "l2_s": null
+  },
+  "versions": {
+    "checker": "0.1.0",
+    "python": "3.11.15",
+    "opencv": "5.0.0",
+    "numpy": "2.4.6",
+    "ffprobe": "6.1.1-3ubuntu5"
+  }
+}

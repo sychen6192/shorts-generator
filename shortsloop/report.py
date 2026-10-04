@@ -94,6 +94,13 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
               f"{'TRIPPED' if budget.get('wall_tripped') else 'within budget'} |")
     md.append(f"| Generation / judge time | {_fmt_min(budget.get('gen_s'))} / "
               f"{_fmt_min(budget.get('judge_s'))} |")
+    gen = run_meta.get("gen_params") or {}
+    if gen:
+        fb = run_meta.get("gen_fallback") or {}
+        md.append(f"| Generation | {gen.get('width')}x{gen.get('height')} · "
+                  f"{gen.get('length')} frames @ {gen.get('fps'):g} fps — "
+                  + (f"⚠️ fallback defaults for {', '.join(sorted(fb))} (not in the "
+                     f"sheet's 共用參數)" if fb else "from the sheet") + " |")
     md.append(f"| Thresholds | v{run_meta.get('thresholds_version')} "
               f"(calibrated: {run_meta.get('thresholds_calibrated')}) |")
     md.append("")

@@ -28,8 +28,9 @@ from pathlib import Path
 
 import yaml
 
+from .check import load_thresholds
 from .comfy import ComfyClient, GenerationFailed
-from .dispatch import ClipSpec, expectations, parse_dispatch
+from .dispatch import ClipSpec, parse_dispatch
 from .encode import EncodeFailed, encode_silent
 from .errors import InfraError
 from .policy import plan_reroll
@@ -48,7 +49,15 @@ DEFAULT_POLICIES = {
     "vram_handoff": {"free_min_gb": 24, "wait_timeout_s": 180},
 }
 
-GEN_DEFAULTS = {"width": 720, "height": 1280, "length": 81}
+# Nightly defaults (plan §0.4: 720x1280, 81 frames @ 16 fps — Wan 2.2 14B native).
+GEN_DEFAULTS = {"width": 720, "height": 1280, "length": 81, "fps": 16.0}
+
+
+def spec_expectations(gen: dict) -> dict:
+    """What the L1 spec check verifies: exactly what generation was asked for."""
+    return {"width": gen["width"], "height": gen["height"], "fps": gen["fps"],
+            "frames": gen["length"],
+            "duration_s": round(gen["length"] / gen["fps"], 3)}
 
 
 class RunHalted(Exception):
@@ -157,12 +166,13 @@ class Runner:
                     pol[key] = val
         self.pol = pol
 
-        if not self.thresholds_path.is_file():
-            return self._refuse(f"thresholds file not found: {self.thresholds_path}")
-        thr = yaml.safe_load(self.thresholds_path.read_text(encoding="utf-8")) or {}
-        self.thresholds_calibrated = bool(thr.get("calibrated", False))
-        self.thresholds_version = str(thr.get("version", "unversioned"))
-        self.thresholds_sha = sha256_file(self.thresholds_path)
+        try:
+            _thr, thr_info = load_thresholds(self.thresholds_path)
+        except InfraError as e:
+            return self._refuse(str(e))
+        self.thresholds_calibrated = thr_info["calibrated"]
+        self.thresholds_version = thr_info["version"]
+        self.thresholds_sha = thr_info["file_sha256"]
         if not self.thresholds_calibrated and not self.allow_uncalibrated:
             return self._refuse(
                 "thresholds.yaml has calibrated: false — an uncalibrated judge is an "
@@ -179,7 +189,14 @@ class Runner:
         self.gen_params = {**GEN_DEFAULTS,
                            **{k: v for k, v in self.sheet.shared.items()
                               if k in GEN_DEFAULTS}}
-        self.expect = expectations(self.sheet)
+        # plan §2.5: absent shared params fall back to defaults — and say so
+        self.gen_fallback = {k: v for k, v in GEN_DEFAULTS.items()
+                             if k not in self.sheet.shared}
+        if self.gen_fallback:
+            print(f"[shortsloop] dispatch sheet has no usable 共用參數 for "
+                  f"{sorted(self.gen_fallback)} — using defaults {self.gen_fallback}",
+                  file=sys.stderr)
+        self.expect = spec_expectations(self.gen_params)
 
         self.comfy = ComfyClient(
             host=str(comfy_cfg["host"]),
@@ -216,6 +233,7 @@ class Runner:
                       "model": self.judge_cfg.get("model")},
             "policies": self.pol,
             "gen_params": self.gen_params,
+            "gen_fallback": self.gen_fallback,
             "thresholds": {"version": self.thresholds_version,
                            "calibrated": self.thresholds_calibrated,
                            "sha256": self.thresholds_sha},
@@ -228,7 +246,8 @@ class Runner:
                       for spec in self.sheet.clips]
         if not self.resume_dir:
             self.log.event("schedule", "enter",
-                           accepted=len(self.items), skipped=len(self.sheet.skipped))
+                           accepted=len(self.items), skipped=len(self.sheet.skipped),
+                           gen_params=self.gen_params, fallback=self.gen_fallback)
             for row in self.sheet.skipped:
                 self.log.event("schedule", "skip", row["clip_id"], None,
                                mode=row["mode"], reason=row["reason"])
@@ -236,30 +255,81 @@ class Runner:
             return
         # resume: fold prior state
         folded = fold(self.log)
-        attempts_by_clip: dict[str, list[dict]] = {}
+        last_by_attempt: dict[tuple[str, int], dict] = {}
         for rec in self.log.read_attempts():
-            attempts_by_clip.setdefault(rec["clip_id"], []).append(rec)
+            if rec.get("clip_id") and rec.get("attempt"):
+                last_by_attempt[(rec["clip_id"], rec["attempt"])] = rec  # last wins
         for item in self.items:
-            st = folded.get(item.spec.clip_id)
+            cid = item.spec.clip_id
+            st = folded.get(cid)
             if not st:
                 continue
             item.attempts_used = st.attempts_used
             item.prompt_current = st.prompt_current or item.prompt_current
             item.rewritten = st.rewritten
+            item.rewrite_diff = st.rewrite_diff
             item.last_classes = st.last_classes
-            for rec in attempts_by_clip.get(item.spec.clip_id, []):
-                item.attempt_history.append(self._history_entry(rec))
+            for (c, _n), rec in sorted(last_by_attempt.items()):
+                if c == cid:
+                    item.attempt_history.append(self._history_entry(rec))
             if st.status == "passed":
                 item.status = "passed"
                 item.passed_info = {"attempt": st.passed_attempt,
                                     "clip_path": st.clip_path,
                                     "verdict_path": st.verdict_path}
-            elif st.in_flight:
-                item.awaiting = None
-                item.status = "pending"
-                item.next_plan = None
-                item._resume_in_flight = st.in_flight  # type: ignore[attr-defined]
+            elif st.recover:
+                self._restore_interrupted(item, st.recover)
+            elif item.attempts_used > 0:
+                # last attempt ended in a final FAIL/ERROR before the crash: re-plan
+                # its re-roll exactly as the live run would have (plan §2.3)
+                self._schedule_reroll(item, st.last_classes or ["broken"],
+                                      self._adherence_reason(st.last_verdict_path))
         self.log.event("schedule", "ok", data_resumed=True)
+
+    def _restore_interrupted(self, item: ClipRun, rec: dict) -> None:
+        """Resume an attempt a crash/halt interrupted, at the stage it reached —
+        never regenerate a clip that already exists (plan §5 row 14)."""
+        cid, n = item.spec.clip_id, rec["attempt"]
+        prompt_path = self.run_dir / "prompts" / f"{cid}_a{n}.txt"
+        if prompt_path.exists():
+            prompt_used = prompt_path.read_text(encoding="utf-8").strip()
+        else:
+            prompt_used = ((rec.get("record") or {}).get("prompt_text")
+                           or item.prompt_current)
+            prompt_path.write_text(prompt_used + "\n", encoding="utf-8")
+        clip_file = Path(rec["file"]) if rec.get("file") else None
+        if rec["stage"] != "in_flight" and (clip_file is None or not clip_file.is_file()):
+            # the clip is gone: the only honest option is to re-wait the job
+            rec = {**rec, "stage": "in_flight"}
+        item.next_plan = None
+        item._resume = {**rec, "prompt_used": prompt_used,  # type: ignore[attr-defined]
+                        "prompt_path": str(prompt_path)}
+        if rec["stage"] == "awaiting":
+            sheet = self.run_dir / "sheets" / f"{cid}_a{n}.jpg"
+            item.status = "awaiting_l2"
+            item.awaiting = {"attempt": n, "clip_path": str(clip_file),
+                             "prompt_path": str(prompt_path),
+                             "seed": rec.get("seed"), "steps": rec.get("steps"),
+                             "prompt_used": prompt_used,
+                             "prompt_id": rec.get("prompt_id"),
+                             "sheet": str(sheet) if sheet.exists() else None,
+                             "gen_s": (rec.get("record") or {}).get("gen_elapsed_s"),
+                             "vram_before": (rec.get("record") or {})
+                             .get("vram_free_before_gb"),
+                             "action": (rec.get("record") or {}).get("reroll_action")}
+            item._resume = None  # type: ignore[attr-defined]
+        else:
+            item.status = "pending"
+
+    def _adherence_reason(self, verdict_path: str | None) -> str:
+        if not verdict_path:
+            return ""
+        try:
+            v = json.loads(Path(verdict_path).read_text(encoding="utf-8"))
+            dims = (v.get("l2") or {}).get("dimensions") or {}
+            return (dims.get("prompt_adherence") or {}).get("reason", "") or ""
+        except (OSError, ValueError, AttributeError):
+            return ""
 
     # ---------------------------------------------------------------- helpers
     def _elapsed(self) -> float:
@@ -285,12 +355,14 @@ class Runner:
             argv += ["--config", str(self.config_path)]
         if self.expect:
             argv += ["--expect", json.dumps(self.expect)]
+        out = Path(out_json)
+        for stale in (out, out.with_suffix(".l2_raw.json")):
+            stale.unlink(missing_ok=True)   # only THIS invocation's verdict counts
         try:
             res = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
         except subprocess.TimeoutExpired:
             raise RunHalted("checker subprocess hung >1800s — instrument broken")
         verdict = None
-        out = Path(out_json)
         if out.exists():
             try:
                 verdict = json.loads(out.read_text(encoding="utf-8"))
@@ -322,6 +394,7 @@ class Runner:
             "seed": seed,
             "prompt_text": prompt_used,
             "prompt_sha256": sha256_text(prompt_used),
+            "prompt_base": item.prompt_current,   # re-roll base (resume)
             "prompt_rewritten": item.rewritten,
             "prompt_diff": item.rewrite_diff if item.rewritten else None,
             "workflow_path": str(wf),
@@ -345,6 +418,9 @@ class Runner:
             "wave": self.waves_run,
         }
         self.log.attempt(rec)
+        # one history row per attempt: a final line supersedes an `unjudged` one
+        item.attempt_history = [h for h in item.attempt_history
+                                if h.get("attempt") != attempt]
         item.attempt_history.append(self._history_entry(rec))
 
     @staticmethod
@@ -394,14 +470,22 @@ class Runner:
     # ---------------------------------------------------------------- stages
     def _generation_phase(self) -> None:
         for item in self.items:
-            resume_job = getattr(item, "_resume_in_flight", None)
-            if resume_job and item.status == "pending":
-                self._finish_generation(item, resume_job["attempt"],
-                                        resume_job.get("seed"),
-                                        item.prompt_current,
-                                        resume_job.get("steps"),
-                                        resume_job["prompt_id"], resumed=True)
-                item._resume_in_flight = None  # type: ignore[attr-defined]
+            resume = getattr(item, "_resume", None)
+            if resume and item.status == "pending":
+                item._resume = None  # type: ignore[attr-defined]
+                n = resume["attempt"]
+                common = dict(prompt_path=Path(resume["prompt_path"]), resumed=True,
+                              action=(resume.get("record") or {}).get("reroll_action"))
+                if resume["stage"] == "generated":
+                    self.log.event("generate", "ok", item.spec.clip_id, n,
+                                   file=resume["file"], resumed=True)
+                    self._l1_gate(item, n, resume.get("seed"), resume["prompt_used"],
+                                  resume.get("steps"), resume.get("prompt_id"),
+                                  Path(resume["file"]), gen_elapsed=None, **common)
+                else:
+                    self._finish_generation(item, n, resume.get("seed"),
+                                            resume["prompt_used"], resume.get("steps"),
+                                            resume.get("prompt_id"), **common)
             while item.status == "pending":
                 cid = item.spec.clip_id
                 if item.attempts_used >= self.pol["max_attempts_per_clip"]:
@@ -472,6 +556,9 @@ class Runner:
                 prompt_path.write_text(prompt_used + "\n", encoding="utf-8")
         t0 = t0 if t0 is not None else self.clock()
         try:
+            if not prompt_id:
+                raise GenerationFailed("no_files", "resume: no ComfyUI prompt_id "
+                                                   "recorded to re-attach to")
             result = self.comfy.wait(prompt_id, clips_dir)
         except GenerationFailed as e:
             item.attempts_used = max(item.attempts_used, n)
@@ -500,7 +587,16 @@ class Runner:
             shutil.move(str(src), clip_file)
         self.log.event("generate", "ok", cid, n, file=str(clip_file),
                        elapsed_s=round(gen_elapsed, 1), resumed=resumed)
+        self._l1_gate(item, n, seed, prompt_used, steps, prompt_id, clip_file,
+                      gen_elapsed=gen_elapsed, prompt_path=prompt_path,
+                      vram_before=vram_before, action=action)
 
+    def _l1_gate(self, item, n, seed, prompt_used, steps, prompt_id, clip_file,
+                 *, gen_elapsed, prompt_path, vram_before=None, action=None,
+                 resumed=False) -> None:
+        """Inline CPU L1 gate on a downloaded clip (Wan stays loaded)."""
+        cid = item.spec.clip_id
+        item.attempts_used = max(item.attempts_used, n)
         sheet = contact_sheet(clip_file, self.run_dir / "sheets" / f"{cid}_a{n}.jpg")
         self.log.event("verify", "enter", cid, n, layer="l1")
         code, verdict = self._invoke_checker(
@@ -571,6 +667,13 @@ class Runner:
             self.pol["vram_handoff"]["wait_timeout_s"])
         self.log.event("verify", "ok", None, None, layer="vram_handoff",
                        vram_free_gb=round(free_gb, 1))
+        try:
+            self._judge_wave(awaiting)
+        finally:
+            self.judge_s += self.clock() - t0
+            self._unload_judge()   # hard rule 3: on every exit path, halts included
+
+    def _judge_wave(self, awaiting: list[ClipRun]) -> None:
         consecutive_clip_errors = 0
         for item in awaiting:
             aw = item.awaiting
@@ -629,8 +732,6 @@ class Runner:
                 if "prompt_adherence" in dims:
                     adherence_reason = dims["prompt_adherence"].get("reason", "")
                 self._schedule_reroll(item, classes, adherence_reason)
-        self.judge_s += self.clock() - t0
-        self._unload_judge()
 
     def _unload_judge(self) -> None:
         try:
@@ -664,6 +765,33 @@ class Runner:
                 self.log.event("persist", "fail", cid, item.passed_info["attempt"],
                                error=str(e)[:300])
 
+    def _halt(self, status: str, reason: str) -> str:
+        """Stop cleanly: log the halt, and give every generated-but-unjudged
+        attempt its attempts.jsonl line (hard rule 6) — --resume judges those
+        clips instead of regenerating them."""
+        self.halt_reason = reason
+        self.log.event("complete", "halt", None, None, reason=reason[:500])
+        for item in self.items:
+            aw = item.awaiting
+            if item.status != "awaiting_l2" or not aw:
+                continue
+            try:
+                self._record_attempt(
+                    item, attempt=aw["attempt"], seed=aw["seed"],
+                    prompt_used=aw["prompt_used"], steps=aw["steps"],
+                    status="unjudged", classes=[], verdict="PROCEED",
+                    verdict_path=self.run_dir / "verdicts"
+                    / f"{item.spec.clip_id}_a{aw['attempt']}.l1.json",
+                    output_path=aw["clip_path"], prompt_id=aw["prompt_id"],
+                    gen_s=aw.get("gen_s"), sheet=aw.get("sheet"),
+                    action=aw.get("action"), vram_before=aw.get("vram_before"),
+                    note=f"L1 PROCEED; run halted before the judge — "
+                         f"--resume judges this clip ({reason[:120]})")
+            except Exception as e:  # never let bookkeeping mask the halt itself
+                print(f"[shortsloop] could not log unjudged attempt for "
+                      f"{item.spec.clip_id}: {e}", file=sys.stderr)
+        return status
+
     # ---------------------------------------------------------------- run
     def run(self) -> int:
         refusal = self._load()
@@ -671,10 +799,10 @@ class Runner:
             return refusal
         self._init_run_dir()
         self._t_start = self.clock()
-        self._init_items()
 
         status = "COMPLETED"
         try:
+            self._init_items()
             waves_max = min(self.pol["waves_max"], self.pol["max_attempts_per_clip"])
             while self.waves_run < waves_max:
                 pending = [i for i in self.items if i.status == "pending"]
@@ -688,14 +816,18 @@ class Runner:
                 if item.status == "pending":
                     item.status = "skipped"
                     item.skip_reason = "wave limit reached"
-        except (RunHalted, InfraError) as e:
-            self.halt_reason = str(e)
-            status = "HALTED(infra)"
-            self.log.event("complete", "halt", None, None, reason=str(e)[:500])
-        else:
             self._persist_phase()
-        if self.wall_tripped:
-            status = status if status.startswith("HALTED") else "COMPLETED(budget-stopped)"
+        except (RunHalted, InfraError) as e:
+            status = self._halt("HALTED(infra)", str(e))
+        except KeyboardInterrupt:
+            status = self._halt("HALTED(interrupted)", "interrupted (SIGINT)")
+        except Exception as e:  # a runner bug is a broken instrument: report, ship nothing
+            import traceback
+            traceback.print_exc()
+            status = self._halt("HALTED(crash)",
+                                f"runner crashed: {type(e).__name__}: {e}")
+        if self.wall_tripped and not status.startswith("HALTED"):
+            status = "COMPLETED(budget-stopped)"
 
         budget = {
             "wall_s": round(self._elapsed(), 1),
@@ -717,6 +849,8 @@ class Runner:
             "dispatch_sha256": self.sheet.sha256,
             "thresholds_version": self.thresholds_version,
             "thresholds_calibrated": self.thresholds_calibrated,
+            "gen_params": self.gen_params,
+            "gen_fallback": self.gen_fallback,
         }
         render(self.run_dir, run_meta, self.items, budget, self.sheet.skipped)
         self.log.event("complete", "ok" if status.startswith("COMPLETED") else "halt",

@@ -8,6 +8,7 @@ margins; exact decision values are Phase 0's job, not the tests'.
 from __future__ import annotations
 
 import subprocess
+import zlib
 from pathlib import Path
 
 import cv2
@@ -62,7 +63,7 @@ def _moving_frames(rng: np.random.Generator, n: int = N_FRAMES) -> list[np.ndarr
 
 
 def make_clip(kind: str, path: Path, n: int = N_FRAMES) -> Path:
-    rng = np.random.default_rng(abs(hash(kind)) % (2 ** 32))
+    rng = np.random.default_rng(zlib.crc32(kind.encode()))  # stable across processes
     if kind == "static":
         base = _texture(rng)
         frames01 = [np.clip(base + rng.normal(0, 0.004, base.shape).astype(np.float32), 0, 1)

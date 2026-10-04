@@ -26,17 +26,14 @@ import yaml
 
 from .. import l1
 from ..state import _read_jsonl
+from ..thresholds import FROZEN_L1, validate_thresholds
 from ..verdict import sha256_file
 
-CHECK_DEFS = {   # name -> (metric, op) — §2.4 frozen shape
-    "motion":     ("flow_mag_median", ">="),
-    "freeze":     ("freeze_longest_run_s", "<="),
-    "flicker":    ("flicker_dips", "<="),
-    "ssim_floor": ("ssim_min", ">="),
-    "sharpness":  ("laplacian_p10", ">="),
-    "black":      ("black_frame_frac", "<="),
-    "exposure":   ("clipped_frac", "<="),
-}
+CHECK_DEFS = FROZEN_L1   # name -> (metric, op) — §2.4 frozen shape
+# Used only when a check has neither labeled examples nor labeled-pass clips.
+FALLBACKS = {"motion": 0.0015, "freeze": 1.5, "flicker": 2, "ssim_floor": 0.35,
+             "sharpness": 5.0, "black": 0.5, "exposure": 0.5}
+FRACTION_METRICS = {"black_frame_frac", "clipped_frac"}
 DETECTORS = {"static": ["motion", "freeze"], "flicker": ["flicker", "ssim_floor"]}
 GUARDS = ("sharpness", "black", "exposure")
 L2_DIM_FOR_CLASS = {"off_prompt": ["prompt_adherence"],
@@ -155,7 +152,10 @@ def guard_value(check: str, ids: list[str], labels: dict, metrics: dict,
         return fallback
     if op == ">=":
         return round(min(good) * 0.5, 6)
-    return round(min(1.0, max(good) * 1.5 + 0.02), 6)
+    if metric in FRACTION_METRICS:
+        return round(min(1.0, max(good) * 1.5 + 0.02), 6)
+    # counts / seconds: never below the worst labeled pass, with headroom
+    return round(max(good) * 1.5 + (1 if metric == "flicker_dips" else 0.5), 6)
 
 
 def evaluate_l1(ids: list[str], labels: dict, metrics: dict,
@@ -212,13 +212,21 @@ def run_tune(cal_dir: str, approve: bool = False, target: str = "thresholds.yaml
     for cls, checks in DETECTORS.items():
         for check in checks:
             res = sweep_detector(check, cls, tune_ids, labels, metrics)
+            if res["value"] is None:
+                # No labeled examples of this class: a null value would crash every
+                # checker run after sign-off. Fall back to a guard rail that never
+                # fails a labeled-pass clip — and say so loudly.
+                res = {"value": guard_value(check, tune_ids, labels, metrics,
+                                            FALLBACKS[check]),
+                       "note": f"UNTUNED — no labeled {cls} examples; guard rail "
+                               f"from labeled-pass margins only (label some {cls} "
+                               f"clips and re-tune to calibrate this check)"}
             sweep_notes[check] = {**res, "class": cls}
             metric, op = CHECK_DEFS[check]
             l1_section[check] = {"metric": metric, "op": op, "value": res["value"]}
-    fallbacks = {"sharpness": 5.0, "black": 0.5, "exposure": 0.5}
     for check in GUARDS:
         metric, op = CHECK_DEFS[check]
-        val = guard_value(check, tune_ids, labels, metrics, fallbacks[check])
+        val = guard_value(check, tune_ids, labels, metrics, FALLBACKS[check])
         l1_section[check] = {"metric": metric, "op": op, "value": val}
         sweep_notes[check] = {"value": val, "class": "(guard)",
                               "note": "guard rail from labeled-pass margins"}
@@ -285,13 +293,25 @@ def _approve(cal: Path, target: str) -> int:
     if not proposed_path.is_file():
         print(f"[calibrate-tune] nothing to approve — {proposed_path} missing")
         return 2
-    data = yaml.safe_load(proposed_path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(proposed_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as e:
+        print(f"[calibrate-tune] REFUSING approve: {proposed_path} unparseable: {e}")
+        return 2
+    if not isinstance(data, dict) or not isinstance(data.get("provenance"), dict):
+        print(f"[calibrate-tune] REFUSING approve: {proposed_path} is not a proposal")
+        return 2
     current_sha = sha256_file(cal / "labels.jsonl")
-    if data.get("provenance", {}).get("labels_sha256") != current_sha:
+    if data["provenance"].get("labels_sha256") != current_sha:
         print("[calibrate-tune] REFUSING approve: labels.jsonl changed since tuning "
               "— re-run calibrate-tune first")
         return 2
     data["calibrated"] = True
+    problems = validate_thresholds(data)
+    if problems:
+        print("[calibrate-tune] REFUSING approve: proposal is off the frozen "
+              "thresholds shape (plan §2.4): " + "; ".join(problems))
+        return 2
     Path(target).write_text(yaml.safe_dump(data, sort_keys=False,
                                            allow_unicode=True), encoding="utf-8")
     print(f"[calibrate-tune] APPROVED → {target} (calibrated: true). "

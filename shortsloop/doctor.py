@@ -30,6 +30,7 @@ from .comfy import ComfyClient
 from .errors import CheckError, InfraError
 from .judge import make_adapter
 from .judge.base import RetryableJudgeError
+from .thresholds import validate_thresholds
 
 PROBE_SCHEMA = {"type": "object",
                 "properties": {"dominant_color": {"type": "string",
@@ -211,7 +212,12 @@ def _check_disk_and_files(doc: Doctor, cfg: dict, pol: dict,
             f"{free_gb:.0f} GB free at {probe_dir.resolve()} (floor {floor:.0f} GB)")
     if thresholds_path.is_file():
         thr = yaml.safe_load(thresholds_path.read_text(encoding="utf-8")) or {}
-        calibrated = bool(thr.get("calibrated"))
+        problems = validate_thresholds(thr)
+        if problems:
+            doc.add("thresholds", False, f"{thresholds_path} off the frozen shape: "
+                                         + "; ".join(problems))
+            return
+        calibrated = thr["calibrated"] is True
         doc.add("thresholds", calibrated,
                 f"v{thr.get('version')} calibrated={calibrated}"
                 + ("" if calibrated else " — Phase 0 pending; unattended runs "

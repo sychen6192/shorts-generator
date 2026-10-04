@@ -134,12 +134,19 @@ def _parse_response(raw: str) -> dict:
         entry = data.get(dim)
         if not isinstance(entry, dict):
             raise RetryableJudgeError(f"missing/invalid dimension {dim!r}")
+        # Strict types (fail closed): bool is an int subclass and "false" is truthy —
+        # neither may slip a failing dimension past the floors.
         score = entry.get("score")
-        if isinstance(score, float) and score.is_integer():
+        if type(score) is float and score.is_integer():
             score = int(score)
-        if not isinstance(score, int) or not (1 <= score <= 5):
+        if type(score) is not int or not (1 <= score <= 5):
             raise RetryableJudgeError(f"{dim}.score must be an integer 1-5, got {score!r}")
-        na = bool(entry.get("na", False)) and dim in NA_ALLOWED
+        na_raw = entry.get("na")
+        if na_raw is None:
+            na_raw = False
+        if type(na_raw) is not bool:
+            raise RetryableJudgeError(f"{dim}.na must be a JSON boolean, got {na_raw!r}")
+        na = na_raw and dim in NA_ALLOWED
         reason = entry.get("reason")
         if not isinstance(reason, str):
             raise RetryableJudgeError(f"{dim}.reason must be a string")

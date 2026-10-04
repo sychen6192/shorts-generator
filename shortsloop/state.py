@@ -79,61 +79,130 @@ class ClipState:
     """Folded view of one clip, rebuilt from the logs on resume."""
     clip_id: str
     attempts_used: int = 0
-    status: str = "pending"          # pending | awaiting_l2 | passed | failed_final
-                                     # | skipped | error
+    status: str = "pending"          # pending | awaiting_l2 | passed
     last_classes: list[str] = field(default_factory=list)
-    prompt_current: str | None = None
+    prompt_current: str | None = None  # BASE prompt for the next attempt (rewritten
+                                       # or None = the sheet's); never carries a
+                                       # per-attempt motion phrase
     rewritten: bool = False
+    rewrite_diff: str | None = None
     passed_attempt: int | None = None
     verdict_path: str | None = None
     clip_path: str | None = None
-    in_flight: dict | None = None    # {"attempt": n, "prompt_id": ..., "seed": ...}
+    last_verdict_path: str | None = None   # verdict of the last FINAL attempt
+    # The latest attempt if it has no final attempts.jsonl line — a crash/halt
+    # interrupted it. {"attempt", "stage": in_flight|generated|awaiting, "seed",
+    # "steps", "prompt_id", "file", "record"} — the runner resumes it at that
+    # stage instead of paying for a regeneration (plan §5 row 14).
+    recover: dict | None = None
+    in_flight: dict | None = None    # == recover when stage == "in_flight"
+
+
+# attempts.jsonl `status` values that are NOT a final outcome for that attempt.
+NON_FINAL_STATUSES = ("unjudged",)
 
 
 def fold(log: RunLog) -> dict[str, ClipState]:
-    """Rebuild per-clip state from events + attempts. Attempts are authoritative
-    for consumed attempts/verdicts; events supply in-flight generation info."""
+    """Rebuild per-clip state from events + attempts.
+
+    attempts.jsonl is authoritative for outcomes; when an attempt has several lines
+    (an `unjudged` line written at a halt, then the final line after --resume), the
+    LAST line wins. events.jsonl fills in attempts whose line was never written (hard
+    crash): submitted -> re-attach, downloaded -> run the L1 gate on the file,
+    L1 PROCEED -> straight into the judge wave."""
     clips: dict[str, ClipState] = {}
 
     def st(cid: str) -> ClipState:
         return clips.setdefault(cid, ClipState(clip_id=cid))
 
-    submitted: dict[tuple[str, int], dict] = {}
+    gen: dict[tuple[str, int], dict] = {}
     for ev in log.read_events():
         cid, att = ev.get("clip_id"), ev.get("attempt")
-        if not cid:
+        if not cid or not att:
             continue
-        key = (cid, att or 0)
-        if ev["stage"] == "generate" and ev["event"] == "submitted":
-            submitted[key] = {"attempt": att, **ev.get("data", {})}
-        if ev["stage"] == "generate" and ev["event"] in ("ok", "fail", "error"):
-            submitted.pop(key, None)
-        if ev["stage"] == "claim" and ev["event"] == "skip":
-            s = st(cid)
-            if s.status == "pending":
-                s.status = "skipped"
+        data = ev.get("data") or {}
+        stage, event = ev.get("stage"), ev.get("event")
+        g = gen.setdefault((cid, att), {})
+        if stage == "generate" and event == "enter":
+            g.setdefault("seed", data.get("seed"))
+            g.setdefault("steps", data.get("steps"))
+        elif stage == "generate" and event == "submitted":
+            g["submitted"] = True
+            g["prompt_id"] = data.get("prompt_id")
+            if data.get("seed") is not None:
+                g["seed"] = data["seed"]
+            if "steps" in data:
+                g["steps"] = data["steps"]
+        elif stage == "generate" and event == "ok":
+            g["generated"] = True
+            g["file"] = data.get("file")
+        elif stage == "generate" and event in ("fail", "error"):
+            g["gen_failed"] = True
+        elif (stage == "verify" and event == "ok" and data.get("layer") == "l1"
+              and data.get("verdict") == "PROCEED"):
+            g["l1_proceed"] = True
 
+    records: dict[str, list[dict]] = {}
     for rec in log.read_attempts():
-        s = st(rec["clip_id"])
-        s.attempts_used = max(s.attempts_used, rec.get("attempt", 0))
-        s.prompt_current = rec.get("prompt_text", s.prompt_current)
-        s.rewritten = bool(rec.get("prompt_rewritten", s.rewritten))
-        verdict = rec.get("verdict")
-        s.last_classes = rec.get("failure_classes") or []
-        if verdict == "PASS":
-            s.status = "passed"
-            s.passed_attempt = rec.get("attempt")
-            s.verdict_path = rec.get("verdict_path")
-            s.clip_path = rec.get("output_path")
-        elif verdict == "PROCEED":
-            s.status = "awaiting_l2"
-            s.verdict_path = rec.get("verdict_path")
-            s.clip_path = rec.get("output_path")
-        elif s.status not in ("passed",):
-            s.status = "pending"
+        if rec.get("clip_id") and rec.get("attempt"):
+            records.setdefault(rec["clip_id"], []).append(rec)
 
-    for (cid, _att), info in submitted.items():
+    for cid in sorted({c for c, _ in gen} | set(records)):
+        recs = records.get(cid, [])
+        last_by_attempt = {rec["attempt"]: rec for rec in recs}   # last line wins
+        consumed = set(last_by_attempt) | {
+            n for (c, n), g in gen.items()
+            if c == cid and (g.get("submitted") or g.get("generated"))}
+        if not consumed:
+            continue
         s = st(cid)
-        if s.status in ("pending", "awaiting_l2"):
+        s.attempts_used = max(consumed)
+        for rec in recs:
+            if rec.get("prompt_base"):
+                s.prompt_current = rec["prompt_base"]
+            elif rec.get("prompt_rewritten"):
+                s.prompt_current = rec.get("prompt_text")  # pre-prompt_base logs
+            if rec.get("prompt_rewritten"):
+                s.rewritten = True
+            if rec.get("prompt_diff"):
+                s.rewrite_diff = rec["prompt_diff"]
+        for n in sorted(last_by_attempt):
+            rec = last_by_attempt[n]
+            if rec.get("status") not in NON_FINAL_STATUSES:
+                s.last_classes = rec.get("failure_classes") or []
+                s.last_verdict_path = rec.get("verdict_path")
+
+        latest = s.attempts_used
+        rec = last_by_attempt.get(latest)
+        g = gen.get((cid, latest), {})
+        if rec is not None and rec.get("status") not in NON_FINAL_STATUSES:
+            if rec.get("verdict") == "PASS":
+                s.status = "passed"
+                s.passed_attempt = latest
+                s.verdict_path = rec.get("verdict_path")
+                s.clip_path = rec.get("output_path")
+            continue
+        info = {"attempt": latest, "seed": g.get("seed"), "steps": g.get("steps"),
+                "prompt_id": g.get("prompt_id"), "file": g.get("file"),
+                "record": rec}
+        if rec is not None:                      # `unjudged` line from a halt
+            info.update(stage="awaiting", seed=rec.get("seed"), steps=rec.get("steps"),
+                        prompt_id=rec.get("comfy_prompt_id"),
+                        file=rec.get("output_path"))
+        elif g.get("l1_proceed") and g.get("file"):
+            info["stage"] = "awaiting"
+        elif g.get("generated") and g.get("file"):
+            info["stage"] = "generated"
+        elif g.get("submitted") and not g.get("gen_failed"):
+            info["stage"] = "in_flight"
+        else:
+            # generation failed but the crash beat the attempt line: the attempt
+            # was consumed (GPU time spent) and counts as `broken`.
+            s.last_classes = ["broken"]
+            continue
+        s.recover = info
+        if info["stage"] == "awaiting":
+            s.status = "awaiting_l2"
+        if info["stage"] == "in_flight":
             s.in_flight = info
     return clips

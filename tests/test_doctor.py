@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from conftest import write_thresholds
 from fake_comfy import serve_comfy
 from fake_judge import serve as serve_judge
 
@@ -37,8 +38,7 @@ def _cfg(tmp_path, comfy_host, judge_url) -> Path:
         "policies": {"disk_min_free_gb": 1,
                      "vram_handoff": {"free_min_gb": 20, "wait_timeout_s": 5}}}),
         encoding="utf-8")
-    (tmp_path / "thresholds.yaml").write_text(
-        "version: 't'\ncalibrated: false\nl1: {}\nl2: {floors: {}}\n", encoding="utf-8")
+    write_thresholds(tmp_path / "thresholds.yaml", calibrated=False)
     return cfg
 
 
@@ -110,3 +110,18 @@ def test_doctor_comfy_down(clips, tmp_path):
         snap = json.loads((tmp_path / "doctor.json").read_text(encoding="utf-8"))
     assert code == 2
     assert _check(snap, "comfy.server")["ok"] is False
+
+
+def test_doctor_fails_on_off_shape_thresholds(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        cfg = _cfg(tmp_path, comfy.host, jurl)
+        (tmp_path / "thresholds.yaml").write_text(
+            "version: 't'\ncalibrated: 'false'\nl1: {}\nl2: {floors: {}}\n")
+        code = run_doctor(str(cfg), str(tmp_path / "pipeline.yaml"),
+                          str(tmp_path / "thresholds.yaml"), do_free=True,
+                          out_path=None)
+        snap = json.loads((tmp_path / "doctor.json").read_text(encoding="utf-8"))
+    assert code != 0 and snap["ok"] is False
+    thr = _check(snap, "thresholds")
+    assert thr["ok"] is False and thr["level"] == "FAIL"

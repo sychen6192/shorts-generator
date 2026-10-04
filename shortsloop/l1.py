@@ -201,21 +201,31 @@ def spec_check(container: dict, frames_analyzed: int, expect: dict | None) -> di
     problems: list[str] = []
     if frames_analyzed < 2:
         problems.append(f"only {frames_analyzed} decodable frames")
+    nb = container.get("nb_frames")
+    if nb and abs(frames_analyzed - nb) > SPEC_FRAMES_TOL:
+        # header claims more than decodes: truncated/corrupt stream (plan §5 row 4)
+        problems.append(f"decoded {frames_analyzed} of {nb} frames the container "
+                        f"declares — truncated or corrupt stream")
     if expect:
         for key in ("width", "height"):
             want = expect.get(key)
             if want is not None and container.get(key) != int(want):
                 problems.append(f"{key} {container.get(key)} != expected {want}")
         want_fps = expect.get("fps")
-        if want_fps is not None and container.get("fps") is not None:
-            if abs(container["fps"] - float(want_fps)) > SPEC_FPS_TOL:
+        if want_fps is not None:
+            if container.get("fps") is None:
+                problems.append(f"fps unknown (container reports none), expected {want_fps}")
+            elif abs(container["fps"] - float(want_fps)) > SPEC_FPS_TOL:
                 problems.append(f"fps {container['fps']:.2f} outside {want_fps}±{SPEC_FPS_TOL}")
         want_frames = expect.get("frames")
         if want_frames is not None:
             if abs(frames_analyzed - int(want_frames)) > SPEC_FRAMES_TOL:
                 problems.append(f"frames {frames_analyzed} outside {want_frames}±{SPEC_FRAMES_TOL}")
         want_dur = expect.get("duration_s")
-        if want_dur is not None and container.get("duration_s") is not None:
+        if want_dur is not None and container.get("duration_s") is None:
+            problems.append(f"duration unknown (container reports none), "
+                            f"expected {want_dur}s")
+        elif want_dur is not None:
             lo = float(want_dur) * (1 - SPEC_DURATION_TOL)
             hi = float(want_dur) * (1 + SPEC_DURATION_TOL)
             if not (lo <= container["duration_s"] <= hi):

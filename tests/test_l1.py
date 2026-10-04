@@ -92,3 +92,23 @@ def test_run_checks_rejects_malformed_thresholds(all_metrics):
     with pytest.raises(InfraError):
         l1.run_checks(all_metrics["moving"]["metrics"],
                       {"motion": {"metric": "flow_mag_median", "op": "!!", "value": 0}})
+
+
+def test_spec_check_fails_closed_on_unverifiable_container():
+    """An expectation the container cannot confirm is a spec failure, not a skip."""
+    exp = {"width": 480, "height": 832, "fps": 16.0, "frames": 48, "duration_s": 3.0}
+    base = {"width": 480, "height": 832, "fps": 16.0, "nb_frames": 48,
+            "duration_s": 3.0, "vcodec": "h264"}
+    assert l1.spec_check(base, 48, exp)["pass"] is True
+    assert l1.spec_check({**base, "fps": None}, 48, exp)["pass"] is False
+    assert l1.spec_check({**base, "duration_s": None}, 48, exp)["pass"] is False
+
+
+def test_spec_check_catches_truncation_against_container_header():
+    """moov says 48 frames but only 20 decode (truncated faststart MP4): spec
+    failure even with no dispatch expectation (plan §5 row 4)."""
+    c = {"width": 480, "height": 832, "fps": 16.0, "nb_frames": 48,
+         "duration_s": 3.0, "vcodec": "h264"}
+    res = l1.spec_check(c, 20, None)
+    assert res["pass"] is False and "decoded" in res["reason"]
+    assert l1.spec_check(c, 47, None)["pass"] is True        # encoder off-by-one ok
