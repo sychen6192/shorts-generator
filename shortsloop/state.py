@@ -141,6 +141,10 @@ def fold(log: RunLog) -> dict[str, ClipState]:
         elif (stage == "verify" and event == "ok" and data.get("layer") == "l1"
               and data.get("verdict") == "PROCEED"):
             g["l1_proceed"] = True
+        elif stage == "claim" and event == "ok" and "prompt_base" in data:
+            g["base"] = {"prompt_base": data.get("prompt_base"),
+                         "rewritten": bool(data.get("rewritten")),
+                         "rewrite_diff": data.get("rewrite_diff")}
 
     records: dict[str, list[dict]] = {}
     for rec in log.read_attempts():
@@ -166,6 +170,11 @@ def fold(log: RunLog) -> dict[str, ClipState]:
                 s.rewritten = True
             if rec.get("prompt_diff"):
                 s.rewrite_diff = rec["prompt_diff"]
+        base = gen.get((cid, s.attempts_used), {}).get("base")
+        if base:   # claimed after the last attempt line: its base is the newest
+            s.prompt_current = base["prompt_base"] or s.prompt_current
+            s.rewritten = s.rewritten or base["rewritten"]
+            s.rewrite_diff = base["rewrite_diff"] or s.rewrite_diff
         for n in sorted(last_by_attempt):
             rec = last_by_attempt[n]
             if rec.get("status") not in NON_FINAL_STATUSES:

@@ -112,6 +112,7 @@ class ClipRun:
     encode_error: str | None = None
     attempt_history: list[dict] = field(default_factory=list)
     resume: dict | None = None    # interrupted attempt to finish first (--resume)
+    replan: tuple | None = None   # (classes, judge reason): re-roll to plan on resume
 
 
 class Runner:
@@ -186,6 +187,7 @@ class Runner:
             _thr, thr_info = load_thresholds(self.thresholds_path)
         except InfraError as e:
             return self._refuse(str(e))
+        self.thresholds_provenance = _thr.get("provenance") or {}
         self.thresholds_calibrated = thr_info["calibrated"]
         self.thresholds_version = thr_info["version"]
         self.thresholds_sha = thr_info["file_sha256"]
@@ -230,6 +232,16 @@ class Runner:
         problem = judge_unload_problem(self.judge_cfg)
         if problem:
             return self._refuse(problem)
+        cal = self.thresholds_provenance.get("judge")
+        self.calibrated_judge = cal if isinstance(cal, dict) else None
+        here = f"{self.judge_cfg.get('adapter', 'ollama')}/{self.judge_cfg.get('model')}"
+        if (self.thresholds_calibrated and self.calibrated_judge
+                and self.calibrated_judge.get("model")
+                and self.calibrated_judge["model"] != here):
+            return self._refuse(
+                f"thresholds were calibrated with judge {self.calibrated_judge['model']} "
+                f"but config.yaml uses {here} — L2 floors do not transfer between "
+                f"judges; re-run Phase 0 (calibrate-tune --with-l2) for this judge")
         self.rewrite_cfg = effective_rewrite_cfg(self.cfg)
         return None
 
@@ -360,9 +372,12 @@ class Runner:
             prior = self.log.read_events()
             # hard rule 5: the budget is whole-run — charge earlier sessions
             self._t_start -= active_seconds(prior)
-            self.waves_run = max([e["data"].get("wave", 0) for e in prior
-                                  if e.get("stage") == "claim"
-                                  and e.get("event") == "enter"] or [0])
+            # waves restart from the last COMPLETED one: a wave a halt cut short
+            # (even before its first submission) is finished, not skipped
+            self.waves_run = max([e["data"]["wave_done"] for e in prior
+                                  if e.get("stage") == "complete"
+                                  and isinstance((e.get("data") or {}).get("wave_done"),
+                                                 int)] or [0])
         self.log.event("schedule", "enter", accepted=len(self.items),
                        skipped=len(self.sheet.skipped), gen_params=self.gen_params,
                        fallback=self.gen_fallback, resumed=resumed)
@@ -378,7 +393,6 @@ class Runner:
         for rec in self.log.read_attempts():
             if rec.get("clip_id") and rec.get("attempt"):
                 last_by_attempt[(rec["clip_id"], rec["attempt"])] = rec  # last wins
-        interrupted = False
         for item in self.items:
             cid = item.spec.clip_id
             st = folded.get(cid)
@@ -399,14 +413,22 @@ class Runner:
                                     "verdict_path": st.verdict_path}
             elif st.recover:
                 self._restore_interrupted(item, st.recover)
-                interrupted = True
             elif item.attempts_used > 0:
                 # last attempt ended in a final FAIL/ERROR before the crash: re-plan
-                # its re-roll exactly as the live run would have (plan §2.3)
-                self._schedule_reroll(item, st.last_classes or ["broken"],
-                                      self._adherence_reason(st.last_verdict_path))
-        if interrupted and self.waves_run:
-            self.waves_run -= 1          # finish the interrupted wave, don't skip it
+                # its re-roll exactly as the live run would have (plan §2.3) — but
+                # only after interrupted jobs are finished (a rewrite loads a text
+                # LLM; never beside a running Wan job — hard rule 3)
+                item.replan = (st.last_classes or ["broken"],
+                               self._adherence_reason(st.last_verdict_path))
+        for item in self.items:            # already persisted: never re-encode
+            if item.status == "passed":
+                for e in prior:
+                    enc = (e.get("data") or {}).get("encoded")
+                    if (e.get("stage") == "persist" and e.get("event") == "ok"
+                            and e.get("clip_id") == item.spec.clip_id
+                            and e.get("attempt") == item.passed_info["attempt"]
+                            and enc and Path(enc).is_file()):
+                        item.encoded_path = enc
         self.log.event("schedule", "ok", data_resumed=True)
 
     def _restore_interrupted(self, item: ClipRun, rec: dict) -> None:
@@ -641,7 +663,12 @@ class Runner:
                 self._finish_generation(item, n, resume.get("seed"),
                                         resume["prompt_used"], resume.get("steps"),
                                         resume.get("prompt_id"), **common)
-        # 2) new attempts, one job at a time
+        # 2) re-roll plans deferred by --resume (may call the rewrite LLM)
+        for item in self.items:
+            replan, item.replan = item.replan, None
+            if replan and item.status == "pending":
+                self._schedule_reroll(item, *replan)
+        # 3) new attempts, one job at a time
         for item in self.items:
             while item.status == "pending":
                 cid = item.spec.clip_id
@@ -668,7 +695,10 @@ class Runner:
                 seed = self.rng.randint(0, 2 ** 48)
                 prompt_path = self.run_dir / "prompts" / f"{cid}_a{n}.txt"
                 prompt_path.write_text(prompt_used + "\n", encoding="utf-8")
-                self.log.event("claim", "ok", cid, n, action=plan["action"])
+                self.log.event("claim", "ok", cid, n, action=plan["action"],
+                               prompt_base=item.prompt_current,
+                               rewritten=item.rewritten,
+                               rewrite_diff=item.rewrite_diff if item.rewritten else None)
 
                 vram_before = None
                 try:
@@ -713,16 +743,19 @@ class Runner:
         except GenerationFailed as e:
             self.gen_s += self.clock() - t0
             self.log.event("generate", "fail", cid, n, kind=e.kind, detail=e.detail)
+            # hard rule 6 first: the attempt is consumed and logged even if the
+            # cleanup below halts the run
+            self._record_attempt(item, attempt=n, seed=seed, prompt_used=prompt_used,
+                                 steps=steps, status="gen_failed", classes=["broken"],
+                                 prompt_id=prompt_id, note=f"{e.kind}: {e.detail}",
+                                 action=action, vram_before=vram_before)
+            item.status, item.last_classes = "pending", ["broken"]
             # hard rule 4: OUR job must be gone (interrupted / dequeued, verified)
             # before anything else is submitted; then OOM recovery per skill notes
             if prompt_id:
                 self.comfy.ensure_gone(prompt_id,
                                        self.pol["vram_handoff"]["wait_timeout_s"])
             self.comfy.free()
-            self._record_attempt(item, attempt=n, seed=seed, prompt_used=prompt_used,
-                                 steps=steps, status="gen_failed", classes=["broken"],
-                                 prompt_id=prompt_id, note=f"{e.kind}: {e.detail}",
-                                 action=action, vram_before=vram_before)
             self.consecutive_gen_failures += 1
             if self.consecutive_gen_failures >= GEN_INFRA_ESCALATION:
                 raise RunHalted(
@@ -824,6 +857,13 @@ class Runner:
             free_gb = gpu.to_judge(self.comfy, vh["free_min_gb"], vh["wait_timeout_s"])
             self.log.event("verify", "ok", None, None, layer="vram_handoff",
                            vram_free_gb=round(free_gb, 1))
+            want = (self.calibrated_judge or {}).get("model_digest")
+            if self.thresholds_calibrated and want and \
+                    self._current_judge_digest() != want:
+                raise RunHalted(
+                    f"judge build {self._current_judge_digest()} differs from the build "
+                    f"the thresholds were calibrated with ({want}) — re-pull the "
+                    f"calibrated model or re-run Phase 0")
             self._judge_wave(awaiting)
         finally:
             self.judge_s += self.clock() - t0
@@ -861,12 +901,12 @@ class Runner:
                 self._record_attempt(item, status="error", classes=["broken"],
                                      verdict="ERROR",
                                      fail_reasons=self._fail_reasons(verdict), **common)
+                self._schedule_reroll(item, ["broken"])   # the attempt is final
                 limit = self.pol["judge"]["infra_escalation_after"]
                 if self.consecutive_judge_errors >= limit:
                     raise RunHalted(
                         f"{self.consecutive_judge_errors} consecutive clip-scope judge "
                         f"errors — escalating to infrastructure failure (fail closed)")
-                self._schedule_reroll(item, ["broken"])
                 continue
             self.consecutive_judge_errors = 0
             if code == 0:
@@ -906,6 +946,7 @@ class Runner:
 
     def _persist_phase(self) -> None:
         self._persist_started = True
+        refused: list[str] = []
         for item in self.items:
             if item.status != "passed" or item.encoded_path:
                 continue
@@ -916,7 +957,9 @@ class Runner:
                                      .read_text(encoding="utf-8"))
                 ok, why = self._gate(verdict)
                 if not ok:
-                    raise RunHalted(f"ship-gate refused {cid} at persist: {why}")
+                    refused.append(f"{cid}: {why}")
+                    raise EncodeFailed(f"ship-gate refused at persist: {why} — "
+                                       f"not shipped")
                 clip = item.passed_info["clip_path"]
                 if sha256_file(clip) != (verdict.get("clip") or {}).get("sha256"):
                     raise EncodeFailed(f"clip sha256 differs from the one its PASS "
@@ -930,6 +973,9 @@ class Runner:
             except (EncodeFailed, CheckError, OSError, ValueError) as e:
                 item.encode_error = str(e)
                 self.log.event("persist", "fail", cid, att, error=str(e)[:300])
+        if refused:
+            raise RunHalted("ship-gate refused PASS verdict(s) at persist — checker/"
+                            "runner mismatch: " + "; ".join(refused))
 
     def _halt(self, status: str, reason: str) -> str:
         """Stop cleanly: log the halt, give every generated-but-unjudged attempt
@@ -1005,6 +1051,7 @@ class Runner:
                 self.waves_run += 1
                 self._generation_phase()
                 self._judge_phase()
+                self.log.event("complete", "ok", None, None, wave_done=self.waves_run)
             for item in self.items:   # only reachable via misconfig; never silent
                 if item.status == "pending":
                     item.status = "skipped"
@@ -1031,6 +1078,7 @@ class Runner:
             "wall_tripped": self.wall_tripped,
             "disk_tripped": self.disk_tripped,
             "disk_min_free_gb": self.pol["disk_min_free_gb"],
+            "resumed": bool(self.resume_dir),
             "gen_s": round(self.gen_s, 1),
             "judge_s": round(self.judge_s, 1),
             "waves_run": self.waves_run,

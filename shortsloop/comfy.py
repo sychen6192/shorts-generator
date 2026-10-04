@@ -90,7 +90,7 @@ class ComfyClient:
             m = _PATCH_LINE.match(line)
             if m:
                 key = m.group(1)
-                knobs.add("seed" if key in ("seed", "noise_seed") else key)
+                knobs.add({"noise_seed": "seed", "frame_rate": "fps"}.get(key, key))
         return knobs
 
     def _patch_args(self, *, prompt, seed, width, height, length, fps=None,
@@ -104,11 +104,14 @@ class ComfyClient:
             args += ["--steps", str(steps)]
         return args
 
-    def _missing_knobs(self, stdout: str, steps: int | None) -> list[str]:
+    def _missing_knobs(self, stdout: str, steps: int | None,
+                       fps: float | None = None) -> list[str]:
         patched = self._patched_knobs(stdout)
         want = dict(REQUIRED_KNOBS)
         if steps is not None:
             want["steps"] = "steps"
+        if fps is not None:
+            want["fps"] = "fps"
         return [label for key, label in want.items() if key not in patched]
 
     def validate_workflow(self, *, width, height, length, fps=None,
@@ -126,7 +129,7 @@ class ComfyClient:
             return [f"workflow dry run failed: {e.detail}"]
         if res.returncode != 0:
             return [f"workflow unusable: {error_summary(res.stdout, res.stderr)}"]
-        missing = self._missing_knobs(res.stdout, steps)
+        missing = self._missing_knobs(res.stdout, steps, fps)
         return [f"workflow does not expose {', '.join(missing)} as literal inputs "
                 f"the client can patch (linked from another node?) — re-rolls and "
                 f"spec expectations would silently not apply"] if missing else []
@@ -136,14 +139,17 @@ class ComfyClient:
         """Queue one job (returns fast). {"prompt_id", "seed"}. Every failure here
         is the instrument's, never the clip's: unreachable server, unreadable /
         UI-format workflow, node validation rejecting it -> InfraError (halt)."""
-        res = self._run_client(
-            ["submit", *self._patch_args(prompt=prompt, seed=seed, width=width,
-                                         height=height, length=length, fps=fps,
-                                         steps=steps)],
-            timeout_s=300)
+        try:
+            res = self._run_client(
+                ["submit", *self._patch_args(prompt=prompt, seed=seed, width=width,
+                                             height=height, length=length, fps=fps,
+                                             steps=steps)],
+                timeout_s=300)
+        except GenerationFailed as e:
+            raise InfraError("l1", f"ComfyUI submit did not return: {e.detail}")
         result = self._parse_result(res.stdout or "")
         if res.returncode == 0 and result and result.get("ok") and result.get("prompt_id"):
-            missing = self._missing_knobs(res.stdout or "", steps)
+            missing = self._missing_knobs(res.stdout or "", steps, fps)
             if missing:
                 raise InfraError("l1", f"job {result['prompt_id']} was submitted without "
                                        f"patching {', '.join(missing)} — workflow knobs "

@@ -97,3 +97,15 @@ def test_validate_workflow_requires_every_reroll_knob(tmp_path):
     linked.write_text(json.dumps(wf))
     problems = ComfyClient(host="127.0.0.1:9", workflow=linked).validate_workflow(**GEN)
     assert any("seed" in p for p in problems)
+
+
+def test_validate_workflow_requires_a_patchable_fps(tmp_path):
+    """The spec check enforces the sheet's fps; a workflow whose fps the client
+    cannot patch would fail every attempt's spec check all night."""
+    wf = json.loads(WF.read_text())
+    for node in wf.values():
+        node.get("inputs", {}).pop("fps", None)
+    no_fps = tmp_path / "no_fps.json"
+    no_fps.write_text(json.dumps(wf))
+    problems = ComfyClient(host="127.0.0.1:9", workflow=no_fps).validate_workflow(**GEN)
+    assert any("fps" in p for p in problems)

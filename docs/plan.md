@@ -83,7 +83,14 @@ shortsloop-check CLIP.mp4 --prompt-file PROMPT.txt --json VERDICT.json
   `thresholds.calibrated == true`. *Amended 2026-10-04:* no override exists; a
   supervised `--allow-uncalibrated` run encodes its PASS clips to
   `encoded_uncalibrated/` (never `encoded/`), and persist re-checks that the clip's
-  bytes still hash to the verdict's `clip.sha256`.
+  bytes still hash to the verdict's `clip.sha256`. The nightly judge must be the one
+  the thresholds were calibrated with (`provenance.judge`): another model refuses
+  at start, another build of the same model halts before the first judge call.
+- Judge replies (*amended 2026-10-04*): the reply must BE the five-dimension JSON
+  object, optionally after one complete `<think>…</think>` block and inside one
+  ``` fence; unterminated reasoning, prose around the object, or a truncated reply
+  (`done_reason`/`finish_reason` = length) is retried, then clip ERROR — never parsed
+  out of surrounding text.
 - Standalone hand use works with nothing but the clip + prompt file (+ reachable judge
   for full mode).
 
@@ -265,7 +272,11 @@ runs/.shortsloop.lock               # one runner per runs dir (hard rule 4)
 `stage ∈ {schedule, claim, generate, verify, persist, complete}` (exactly the manifest
 vocabulary) and `event ∈ {enter, ok, fail, error, skip}` — *amended 2026-10-04,
 documenting existing use:* plus `submitted` (generate: ComfyUI accepted the job; its
-prompt_id is what resume re-attaches to) and `halt` (complete: infra stop).
+prompt_id is what resume re-attaches to) and `halt` (complete: infra stop). A
+`complete ok {wave_done: N}` event marks each finished wave (resume continues from
+the last finished wave, so a wave cut short is redone, never skipped), and `claim ok`
+carries the attempt's re-roll base (`prompt_base`, `rewritten`, `rewrite_diff`) so a
+rewrite in flight at a crash survives --resume.
 
 `attempts.jsonl` line: `{ts, clip_id, attempt, seed, prompt_text, prompt_sha256,
 prompt_rewritten: bool, prompt_diff, workflow_path, workflow_sha256, patch_args,

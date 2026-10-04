@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from shortsloop.encode import EncodeFailed, encode_silent
@@ -42,7 +44,10 @@ def test_encoded_audio_is_aac_and_actually_silent(clips, tmp_path):
     vol = subprocess.run(["ffmpeg", "-nostats", "-i", str(out), "-map", "0:a:0",
                           "-af", "volumedetect", "-f", "null", "-"],
                          capture_output=True, text=True).stderr
-    assert "max_volume: -inf dB" in vol or "max_volume: -9" in vol
+    m = re.search(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB", vol)
+    assert m, vol
+    peak = float("-inf") if "inf" in m.group(1) else float(m.group(1))
+    assert peak <= -80.0, f"audible: max_volume {peak} dB"
 
 
 def test_nonconforming_encode_leaves_nothing_in_the_shipping_folder(clips, tmp_path,

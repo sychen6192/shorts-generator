@@ -17,7 +17,9 @@ while another job was still unfinished (hung jobs included).
 
 VRAM model: loading Wan (/prompt) drops vram_free to `vram_loaded_gb`; each /free
 sets it to the next value of `free_results` (default: vram_after_free_gb), or
-leaves it untouched when `never_frees`.
+leaves it untouched when `never_frees`. Like real ComfyUI (server.py /free only
+sets queue flags; the prompt worker applies them after the running job), a /free
+received while a job is unfinished is DEFERRED until no job is running.
 """
 
 from __future__ import annotations
@@ -100,6 +102,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({})
                 return
             job["done"] = True
+            job.setdefault("done_at", time.monotonic())
+            srv.apply_deferred_free()
             if job["scenario"].get("error"):
                 self._json({pid: {"status": {
                     "status_str": "error", "completed": False,
@@ -157,13 +161,13 @@ class _Handler(BaseHTTPRequestHandler):
                              "info": _extract(payload.get("prompt", {})),
                              "order": len(srv.submissions)}
             srv.submissions.append(pid)
+            srv.submit_times.append(time.monotonic())
             self._json({"prompt_id": pid, "number": len(srv.submissions)})
         elif self.path == "/free":
             srv.free_calls += 1
             srv.free_times.append(time.monotonic())
-            if not srv.never_frees:
-                srv.vram_free_gb = (srv.free_results.pop(0) if srv.free_results
-                                    else srv.vram_after_free_gb)
+            srv.free_pending = True
+            srv.apply_deferred_free()
             self._json({})
         elif self.path == "/interrupt":
             srv.interrupt_calls += 1
@@ -171,6 +175,8 @@ class _Handler(BaseHTTPRequestHandler):
             if live:                                    # stops the RUNNING job only
                 srv.jobs[live[0]]["interrupted"] = True
                 srv.jobs[live[0]]["done"] = True
+                srv.jobs[live[0]]["done_at"] = time.monotonic()
+                srv.apply_deferred_free()
             self._json({})
         elif self.path == "/queue":
             for pid in payload.get("delete") or []:
@@ -179,6 +185,7 @@ class _Handler(BaseHTTPRequestHandler):
                     job["deleted"] = True
                     job["done"] = True
                     srv.deleted.append(pid)
+            srv.apply_deferred_free()
             self._json({})
         else:
             self._json({}, 404)
@@ -202,6 +209,8 @@ class FakeComfy(ThreadingHTTPServer):
         self.free_results = list(free_results or [])
         self.torch_cache_gb = torch_cache_gb
         self.deleted: list[str] = []
+        self.submit_times: list[float] = []
+        self.free_pending = False
         self.jobs: dict[str, dict] = dict(preloaded_jobs or {})
         self.submissions: list[str] = []
         self.violations = 0
@@ -211,6 +220,15 @@ class FakeComfy(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         pass
+
+    def apply_deferred_free(self) -> None:
+        """Apply a pending /free once nothing is running (real ComfyUI semantics)."""
+        if not self.free_pending or self.unfinished():
+            return
+        self.free_pending = False
+        if not self.never_frees:
+            self.vram_free_gb = (self.free_results.pop(0) if self.free_results
+                                 else self.vram_after_free_gb)
 
     def unfinished(self) -> list[str]:
         """prompt_ids not yet finished, in execution order (hung jobs included)."""

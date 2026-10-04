@@ -66,7 +66,8 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
         md.append(f"> ⛔ **{status}** — {run_meta.get('halt_reason', '')}")
         md.append("> Nothing was generated or judged after the halt point. Clips that "
                   "PASSED before it were still encoded (marked below); unfinished clips "
-                  "continue with `shortsloop run --resume <run_dir>`.")
+                  f"continue with `shortsloop run --dispatch {run_dir / 'dispatch.md'} "
+                  f"--resume {run_dir}` once the cause is fixed.")
         md.append("")
     if run_meta.get("allow_uncalibrated") and not run_meta.get("thresholds_calibrated"):
         md.append("> ⚠️ **UNCALIBRATED supervised run** — thresholds are not signed off "
@@ -104,7 +105,9 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
         md.append(f"| Disk floor | {budget['disk_min_free_gb']} GB — "
                   + (f"TRIPPED: {budget['disk_tripped']}" if budget.get("disk_tripped")
                      else "never reached") + " |")
-    md.append(f"| Generation / judge time | {_fmt_min(budget.get('gen_s'))} / "
+    md.append(f"| Generation / judge time"
+              f"{' (this session)' if budget.get('resumed') else ''} | "
+              f"{_fmt_min(budget.get('gen_s'))} / "
               f"{_fmt_min(budget.get('judge_s'))} |")
     gen = run_meta.get("gen_params") or {}
     if gen:

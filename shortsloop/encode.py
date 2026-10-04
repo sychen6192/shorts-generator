@@ -36,6 +36,8 @@ def encode_silent(clip_path: str | Path, out_path: str | Path,
         container = _encode_and_verify(clip_path, tmp, timeout_s)
         os.replace(tmp, out)
         return container
+    except subprocess.TimeoutExpired as e:      # a verification step hung
+        raise EncodeFailed(f"encode verification timed out: {e.cmd[0]} >{e.timeout}s")
     finally:
         tmp.unlink(missing_ok=True)
 

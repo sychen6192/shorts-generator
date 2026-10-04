@@ -176,8 +176,9 @@ Only one runner per runs directory: a second invocation (or an overlapping
 Morning workflow: open `runs/<run_id>/report.md` → review contact sheets and
 reasons → layer audio per the dispatch sheet's 音檔需求 table and re-encode with
 `shortsloop/vendor/ig_encode.sh -a bgm.mp3 …` → upload (AI-content label on).
-A crashed or halted run resumes with `shortsloop run --dispatch <the SAME sheet>
---resume runs/<run_id>`: finished verdicts are reused (cache keyed by clip, prompt,
+A crashed or halted run resumes with `shortsloop run --dispatch
+runs/<run_id>/dispatch.md --resume runs/<run_id>` (the halted report prints the exact
+command): finished verdicts are reused (cache keyed by clip, prompt,
 thresholds and judge digest), in-flight ComfyUI jobs are re-attached before anything
 new is submitted, generated-but-unjudged clips go straight to the judge, and the
 wall-clock budget keeps counting from the time already spent. A different sheet is
@@ -191,9 +192,10 @@ refused.
 | `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: judge down, VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts), ComfyUI queue busy or a stuck job that won't clear, 3 consecutive generation failures, 2 consecutive judge errors, checker contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix, then `--resume`. |
 | Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
-| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without an unload hook the next Wan wave halts on the VRAM check, by design. The raw judge reply is kept next to every ERROR verdict (`*.l2_raw.json`). |
+| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp, and set `judge.unload_url` (e.g. llama-swap's `/unload`) — without an unload hook the next Wan wave halts on the VRAM check, by design. When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
 | OOM during generation | Runner already `/free`s and re-rolls; if chronic, drop to 480x832 or 81 frames in the dispatch sheet. |
 | Report shows `encode failed after PASS` | Clip passed QC but the encode failed verification (size/fps/codec/aac/silence) or the clip bytes no longer match the verdict — nothing was left in `encoded/`; the raw file is kept in `runs/<id>/clips/`. |
+| `run` refuses: thresholds calibrated with another judge / halts: judge build differs | L2 floors are tuned to one judge model and build (`thresholds.yaml` provenance.judge). Re-pull that build, or re-run Phase 0 (`calibrate-tune --with-l2`, then `--approve`) for the new judge. |
 | `steps8 n/a` in attempt notes | The re-roll table's `--steps 8` is defined for the 4-step lightx2v build; your workflow runs another step count, so those re-rolls reseed only. |
 
 ## 6. What is still UNVERIFIED-ON-GPU (first-night checklist)
