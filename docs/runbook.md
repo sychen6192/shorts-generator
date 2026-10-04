@@ -83,25 +83,51 @@ Wan). Run plain `shortsloop doctor` before any unattended night.
 ```bash
 # 2a. ~40 draft-res clips, deliberately spanning good and bad (~30-40 min GPU)
 .venv/bin/shortsloop calibrate-batch --count 40
-#     resume-safe: re-run after any interruption, finished rows are skipped
+#     Before the first Wan job it unloads the judge VLM + rewrite LLM, /free's
+#     ComfyUI and VERIFIES free VRAM (pipeline.yaml vram_handoff) — exit 3 if a
+#     model is still resident. One job at a time: it waits for an empty ComfyUI
+#     queue before every submit and removes a timed-out job before moving on.
+#     Resume-safe: Ctrl-C stops the in-flight ComfyUI job, then re-run the same
+#     command; finished rows are skipped. 4 prompt-swap rows (a clip shown with
+#     a DIFFERENT good prompt) are the off-prompt ground truth.
 
 # 2b. label them — keyboard-only web UI, ~10-15 minutes
 .venv/bin/shortsloop label
-#     open the printed URL; keys: 1 pass · 2 static · 3 deformed · 4 flicker
-#     · 5 off-prompt · 6 other · space replay · p previous
+#     Binds 127.0.0.1 (no auth). Headless workstation: from your laptop
+#       ssh -L 8765:127.0.0.1:8765 llm      # then open http://127.0.0.1:8765/
+#     (or --host <LAN address> to bind it directly — anyone who can reach it
+#     can label). Safari works (byte-range serving).
+#     keys: 1 pass · 2 static · 3 deformed · 4 flicker · 5 off-prompt
+#     · 6 other · space replay · p previous · n skip. One label per key press
+#     (held keys ignored); "All clips labeled" only when none is left.
 #     >>> GATE 1: this is YOUR judgment being encoded. <<<
 
 # 2c. score the batch with the VLM judge, then tune
 .venv/bin/shortsloop calibrate-tune --with-l2
-#     read calibration/tuning_report.md: agreement, FALSE-PASS rate (+CI),
-#     per-class catches, what L1 leaves for L2, per-layer attribution.
+#     Judging starts only after ComfyUI is /free'd and free VRAM is verified
+#     (needs comfy.host in config.yaml); the judge is unloaded afterwards.
+#     Scores are keyed by clip+prompt sha and judge model+digest; a clip the
+#     judge cannot evaluate is recorded (a runtime ERROR) and skipped on re-run.
+#     Tuning refuses (writes NO proposal) with < 10 usable labels, all-pass or
+#     all-fail labels, a held-out split missing a pass or a fail, or partial
+#     judge coverage. Labels whose clip bytes changed since labeling are
+#     excluded and listed.
+#     read calibration/tuning_report.md: TEST agreement, FALSE-PASS = labeled-
+#     fail clips that would ship / all labeled-fail clips (+Wilson CI),
+#     false-fail, per-class confusion, per-layer catch attribution (L1 vs L2,
+#     and what each would catch alone) — for the combined L1+L2 decision.
 #     If the 8B judge disagrees with your labels too often, pull a ~32B VL
-#     model, update config.yaml, and re-run this step — the data decides.
+#     model, update config.yaml, and re-run this step: every clip is re-scored
+#     by the new judge and only its scores are used; provenance names it.
 
 # 2d. sign off — THE gate that opens unattended running
 .venv/bin/shortsloop calibrate-tune --approve
-#     copies proposed thresholds → thresholds.yaml with calibrated: true
-#     + provenance (labels sha, split, test stats). Refuses stale labels.
+#     copies proposed thresholds → thresholds.yaml with calibrated: true, a
+#     version above the current one (YYYY-MM-DD.N) + provenance (labels sha,
+#     split, test stats, judge model+digest, input shas). Refuses if labels,
+#     manifest or judge scores changed after tuning, if the values were
+#     hand-edited, if labels.jsonl is gone, or if config.yaml's judge is not
+#     the judge the floors were tuned on.
 ```
 
 Until 2d, `shortsloop run` refuses to start without `--allow-uncalibrated`.
