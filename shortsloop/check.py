@@ -74,6 +74,11 @@ def load_judge_config(path: str | Path | None) -> dict:
     )
 
 
+def _write_raw(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 def _emit(v: dict, json_path: str | None) -> int:
     """Validate (frozen schema + invariants), write atomically, print the VERDICT
     line. An off-contract verdict is an instrument bug: infra ERROR (fail closed)."""
@@ -159,8 +164,12 @@ def _main(argv: list[str] | None = None) -> int:
     thresholds_info = {"version": None, "calibrated": False, "file_sha256": None}
     timing: dict = {"l1_s": None, "l2_s": None}
     stage = "l1"                 # where an unexpected failure is attributed
+    raw_path = (Path(args.json_out).with_suffix(".l2_raw.json")
+                if args.json_out else None)
 
     try:
+        if raw_path is not None:  # a previous run's reply is not evidence for this one
+            raw_path.unlink(missing_ok=True)
         thresholds, thresholds_info = load_thresholds(args.thresholds)
 
         try:
@@ -197,13 +206,20 @@ def _main(argv: list[str] | None = None) -> int:
                                          judge_cfg, floors)
             layers_run.append("l2")
             timing["l2_s"] = round(time.monotonic() - t1, 3)
-            if args.json_out:  # raw judge output kept for audit next to the verdict
-                raw_path = Path(args.json_out).with_suffix(".l2_raw.json")
-                raw_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_path.write_text(l2_raw, encoding="utf-8")
+            if raw_path is not None:  # raw judge output kept for audit beside the verdict
+                _write_raw(raw_path, l2_raw)
 
     except CheckError as e:
         error_obj = e.as_error_obj()
+        # The judge's last reply (if any) is the only evidence of WHY L2 errored —
+        # keep it beside the ERROR verdict too. Best effort: never changes the verdict.
+        raw = getattr(e, "raw", None)
+        if raw_path is not None and isinstance(raw, str):
+            try:
+                _write_raw(raw_path, raw)
+            except OSError as w:
+                print(f"shortsloop-check: could not keep raw judge reply: {w}",
+                      file=sys.stderr)
     except Exception as e:  # unexpected bug in the checker = broken instrument
         error_obj = {"scope": "infra", "stage": stage,
                      "message": f"unexpected checker failure: {type(e).__name__}: {e}"}

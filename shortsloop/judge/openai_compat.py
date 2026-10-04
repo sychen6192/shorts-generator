@@ -5,7 +5,16 @@ workstation (docs/plan.md D10) — switching is a config change, not a rewrite."
 
 from __future__ import annotations
 
+import json
+
+from ..errors import InfraError
 from .base import JudgeAdapter, RetryableJudgeError
+
+# /v1/models entry fields that identify the loaded build, in digest order:
+# `digest` (some servers), `root` (vLLM: weights path/repo), `owned_by` + `meta`
+# (llama.cpp: GGUF n_params/size/vocab/ctx). NOT `created`: llama.cpp and vLLM stamp
+# it with the request time, which would make the digest change on every call.
+BUILD_FIELDS = ("digest", "root", "owned_by", "meta")
 
 
 class OpenAICompatAdapter(JudgeAdapter):
@@ -13,13 +22,25 @@ class OpenAICompatAdapter(JudgeAdapter):
 
     def model_digest(self) -> str:
         models = self._get_json("/v1/models", timeout_s=20)
-        ids = [m.get("id") for m in models.get("data", [])]
+        data = models.get("data") if isinstance(models, dict) else None
+        if not isinstance(data, list):
+            raise InfraError("l2", f"/v1/models at {self.base_url} returned no model "
+                                   f"list: {str(models)[:200]}")
+        entries = [m for m in data if isinstance(m, dict)]
+        ids = [m.get("id") for m in entries]
+        match = [m for m in entries if m.get("id") == self.model]
         # Single-model servers (llama.cpp) often report one arbitrary id; accept it.
-        if self.model in ids or len(ids) == 1:
-            return f"openai-compat:{ids[0] if len(ids) == 1 else self.model}"
-        from ..errors import InfraError
-        raise InfraError("l2", f"model {self.model!r} not served at {self.base_url} "
-                               f"(available: {ids})")
+        entry = match[0] if match else (entries[0] if len(entries) == 1 else None)
+        if entry is None:
+            raise InfraError("l2", f"model {self.model!r} not served at {self.base_url} "
+                                   f"(available: {ids})")
+        parts = [f"openai-compat:{entry.get('id')}"]
+        for key in BUILD_FIELDS:
+            if entry.get(key) is not None:
+                val = json.dumps(entry[key], sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False)
+                parts.append(f"{key}={val}")
+        return " ".join(parts)
 
     def judge(self, frames_jpeg, system, user, response_schema, timeout_s):
         content = [{"type": "text", "text": user}]

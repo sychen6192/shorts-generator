@@ -10,13 +10,30 @@ from ..errors import InfraError
 from .base import JudgeAdapter
 
 
+def normalize_model_name(name) -> str:
+    """Ollama's canonical form: a name without a tag means `<name>:latest`. The tag is
+    the part after ':' in the LAST path segment (a registry host may carry a port)."""
+    name = str(name or "").strip()
+    if name and ":" not in name.rsplit("/", 1)[-1]:
+        name += ":latest"
+    return name
+
+
 class OllamaAdapter(JudgeAdapter):
     name = "ollama"
 
     def model_digest(self) -> str:
         tags = self._get_json("/api/tags", timeout_s=20)
-        for m in tags.get("models", []):
-            if m.get("name") == self.model or m.get("model") == self.model:
+        models = tags.get("models") if isinstance(tags, dict) else None
+        if not isinstance(models, list):
+            raise InfraError("l2", f"ollama /api/tags at {self.base_url} returned no "
+                                   f"model list: {str(tags)[:200]}")
+        want = normalize_model_name(self.model)
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            if want in (normalize_model_name(m.get("name")),
+                        normalize_model_name(m.get("model"))):
                 return m.get("digest", "unknown")
         raise InfraError(
             "l2",
