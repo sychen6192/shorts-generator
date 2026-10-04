@@ -50,6 +50,24 @@ def _solid_jpeg(bgr: tuple[int, int, int]) -> bytes:
     return buf.tobytes()
 
 
+def fingerprint(config_path: str | Path) -> dict:
+    """What a doctor snapshot vouches for. The runner refuses a snapshot whose
+    fingerprint differs from the current setup (a passing doctor for last week's
+    workflow or judge must not open tonight's gate)."""
+    from .verdict import sha256_file
+    p = Path(config_path)
+    try:
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        cfg = {}
+    comfy, judge = cfg.get("comfy") or {}, cfg.get("judge") or {}
+    wf = comfy.get("workflow_t2v")
+    return {"config_sha256": sha256_file(p),
+            "workflow_sha256": sha256_file(wf) if wf else None,
+            "comfy_host": comfy.get("host"),
+            "judge": f"{judge.get('adapter', 'ollama')}/{judge.get('model')}"}
+
+
 class Doctor:
     def __init__(self):
         self.checks: list[dict] = []
@@ -256,6 +274,7 @@ def run_doctor(config_path: str, pipeline_path: str, thresholds_path: str,
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "ok": doc.ok,
         "config": str(cfg_file),
+        "fingerprint": fingerprint(cfg_file),
         "checks": doc.checks,
     }
     out = Path(out_path) if out_path else cfg_file.parent / "doctor.json"

@@ -25,6 +25,19 @@ words; keep the trailing 'vertical 9:16 composition' phrase if present. Return J
 only: {"rewritten_prompt": "..."}."""
 
 
+def effective_rewrite_cfg(cfg: dict) -> dict:
+    """config.yaml `rewrite:` with its server resolved: rewrite.base_url, else the
+    judge's Ollama, else local Ollama (an openai_compat judge server does not
+    speak Ollama's /api/chat)."""
+    rw = dict(cfg.get("rewrite") or {})
+    judge = cfg.get("judge") or {}
+    if not rw.get("base_url"):
+        rw["base_url"] = (judge.get("base_url")
+                          if judge.get("adapter", "ollama") == "ollama" and
+                          judge.get("base_url") else "http://127.0.0.1:11434")
+    return rw
+
+
 def rewrite_prompt(original: str, judge_reason: str, cfg: dict,
                    timeout_s: float = 120) -> tuple[str, str] | None:
     """Returns (rewritten_prompt, unified_diff) or None if the rewrite could not be
@@ -40,6 +53,7 @@ def rewrite_prompt(original: str, judge_reason: str, cfg: dict,
         "stream": False,
         "format": REWRITE_SCHEMA,
         "options": {"temperature": 0.3, "seed": 7},
+        "keep_alive": 0,          # hard rule 3: never resident into a Wan wave
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content":
