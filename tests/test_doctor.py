@@ -609,7 +609,11 @@ def test_disk_measured_on_runs_dir_filesystem_even_if_not_created(clips, tmp_pat
          serve_judge() as (judge, jurl):
         judge.probe_answers = ["red", "blue"]
         code, snap = _run(tmp_path, comfy, jurl, runs_dir=tmp_path / "big" / "runs")
-    assert f"at {tmp_path.resolve()} (" in _check(snap, "disk")["detail"]
+    # measured on the runs_dir filesystem (doctor now creates runs_dir itself: its
+    # GPU checks take runs_dir/.shortsloop.lock, and cron needs the dir to exist)
+    detail = _check(snap, "disk")["detail"]
+    assert f"at {tmp_path.resolve()}" in detail and "(floor" in detail
+    assert (tmp_path / "big" / "runs").is_dir()
 
 
 # ---- rewrite model, config skeleton, cron PATH -------------------------------------
