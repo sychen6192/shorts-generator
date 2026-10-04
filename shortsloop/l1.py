@@ -24,8 +24,11 @@ from .errors import ClipError, InfraError
 
 ANALYSIS_W, ANALYSIS_H = 480, 832
 FLOW_DOWNSCALE = 2               # flow computed at 240x416
-FLICKER_WIN = 7                  # rolling-median window (pairs) for dip detection
-FLICKER_DELTA = 0.03             # SSIM drop below rolling median that counts as a dip
+FLICKER_WIN = 7                  # rolling window (pairs): pair i vs the median of its
+                                 # up-to-3-per-side NEIGHBORS (pair i itself excluded)
+FLICKER_DELTA = 0.03             # SSIM drop below that neighbor median = a dip
+LUMA_FLICKER_DELTA = 0.02        # |Δ mean luma| on BOTH sides of a frame whose luma
+                                 # change reverses sign = a luma reversal (dense strobe)
 FREEZE_SSIM = 0.995              # pair is "frozen" if SSIM >= this ...
 FREEZE_FLOW = 3e-4               # ... and normalized flow <= this
 BLACK_LUMA = 16.0 / 255.0        # frame is "black" if mean luma below this
@@ -100,6 +103,34 @@ def _ssim(a: np.ndarray, b: np.ndarray) -> float:
     return float((num / den).mean())
 
 
+def flicker_dips(ssims, lumas) -> int:
+    """The `flicker_dips` metric (docs/plan.md §2.2, amended 2026-10-04: dense flicker).
+
+    Sum of two counts:
+    - SSIM dips: pairs whose SSIM is >= FLICKER_DELTA below the median SSIM of the
+      neighboring pairs (up to FLICKER_WIN // 2 on each side, pair itself excluded).
+      Catches isolated pops.
+    - Luma reversals: frames whose mean-luma change reverses sign relative to the
+      previous change with |Δluma| >= LUMA_FLICKER_DELTA on both sides. Catches dense
+      flicker (alternate-frame strobing, period-2/3 pulsing, strobe bursts) where every
+      pair is low, so the neighbor median sinks with the dips and hides them.
+    Fades (monotonic) and single cuts (one large step) produce no reversals.
+    """
+    s = np.asarray(ssims, dtype=np.float64)
+    half = FLICKER_WIN // 2
+    dips = 0
+    for i in range(len(s)):
+        nbrs = np.concatenate([s[max(0, i - half):i], s[i + 1:i + half + 1]])
+        if len(nbrs) and float(np.median(nbrs)) - s[i] >= FLICKER_DELTA:
+            dips += 1
+
+    dl = np.diff(np.asarray(lumas, dtype=np.float64))
+    big = np.abs(dl) >= LUMA_FLICKER_DELTA
+    reversals = int(np.count_nonzero(
+        (dl[:-1] * dl[1:] < 0) & big[:-1] & big[1:])) if len(dl) > 1 else 0
+    return dips + reversals
+
+
 def compute_metrics(path: str | Path, fps_hint: float | None = None) -> dict:
     """Decode once, compute all L1 metrics at the canonical analysis resolution.
 
@@ -154,13 +185,7 @@ def compute_metrics(path: str | Path, fps_hint: float | None = None) -> dict:
     flows_a = np.array(flows)
     lap_a = np.array(laplacians)
 
-    # Flicker: pairs whose SSIM sits FLICKER_DELTA below the rolling median.
-    dips = 0
-    half = FLICKER_WIN // 2
-    for i in range(len(ssims_a)):
-        window = ssims_a[max(0, i - half): i + half + 1]
-        if float(np.median(window)) - ssims_a[i] >= FLICKER_DELTA:
-            dips += 1
+    dips = flicker_dips(ssims_a, lumas)
 
     # Freeze: longest run of consecutive frozen pairs, in seconds.
     fps = fps_hint if fps_hint and fps_hint > 0 else 16.0
@@ -252,7 +277,7 @@ _OPS = {
 _CHECK_REASONS = {
     "motion": "median optical flow below floor — near-static clip",
     "freeze": "long frozen segment detected",
-    "flicker": "frame-to-frame SSIM dips — flicker/popping",
+    "flicker": "frame-to-frame SSIM dips / luma reversals — flicker/popping/strobing",
     "ssim_floor": "hard SSIM discontinuity — cut/blow-up between frames",
     "sharpness": "low Laplacian variance — soft/blurry frames",
     "black": "black frames present",

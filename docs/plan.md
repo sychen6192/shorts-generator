@@ -96,8 +96,12 @@ Top-level fields (all always present unless noted):
 - `metrics` (all numeric, all always present):
   `flow_mag_median`, `flow_mag_p90` (mean Farneback magnitude per frame-pair,
   normalized by analysis-frame diagonal; aggregated over pairs),
-  `ssim_min`, `ssim_p05`, `ssim_mean`, `flicker_dips` (count of pairs whose SSIM drops
-  ≥ `flicker_delta` below the rolling median of neighbors),
+  `ssim_min`, `ssim_p05`, `ssim_mean`, `flicker_dips` (*amended 2026-10-04: dense
+  flicker* — the number of pairs whose SSIM is ≥ 0.03 below the median SSIM of up to 3
+  neighboring pairs on each side, the pair itself excluded, PLUS the number of frames
+  whose mean-luma change reverses sign versus the previous change with |Δluma| ≥ 0.02
+  on both sides, so alternate-frame strobing and strobe bursts count, not only isolated
+  pops),
   `freeze_longest_run_s` (longest run of consecutive pairs with SSIM ≥ 0.995 and flow
   ≈ 0), `laplacian_p10`, `laplacian_median` (per-frame Laplacian variance),
   `luma_mean`, `black_frame_frac` (frames with mean luma < 16/255),

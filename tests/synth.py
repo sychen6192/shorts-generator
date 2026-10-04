@@ -18,7 +18,11 @@ FPS = 16
 W, H = 480, 832
 N_FRAMES = 48
 
-KINDS = ("static", "moving", "flicker", "black", "blurry", "freeze_tail")
+KINDS = ("static", "moving", "flicker", "black", "blurry", "freeze_tail",
+         "strobe", "strobe_burst")
+
+STROBE_LUMA = 0.25                       # luma lift on every odd frame of a strobe
+STROBE_BURST = (30, 45)                  # inclusive frame span of a strobe burst (~1 s)
 
 
 def _encode(path: Path, frames: list[np.ndarray], fps: int = FPS) -> Path:
@@ -84,6 +88,19 @@ def make_clip(kind: str, path: Path, n: int = N_FRAMES) -> Path:
         moving = _moving_frames(rng, n)
         cut = int(n * 0.6)
         frames01 = moving[:cut] + [moving[cut - 1]] * (n - cut)
+    elif kind == "strobe":
+        # dense flicker: alternate-frame brightness strobe for the whole clip — every
+        # pair is a "dip", so a dip-vs-rolling-median detector sees a flat baseline
+        frames01 = _moving_frames(rng, n)
+        for i in range(1, n, 2):
+            frames01[i] = np.clip(frames01[i] + STROBE_LUMA, 0, 1)
+    elif kind == "strobe_burst":
+        # ~1 s strobe burst inside an otherwise clean moving clip
+        frames01 = _moving_frames(rng, n)
+        lo, hi = STROBE_BURST
+        for i in range(lo, min(hi, n - 1) + 1):
+            if i % 2:
+                frames01[i] = np.clip(frames01[i] + STROBE_LUMA, 0, 1)
     else:
         raise ValueError(f"unknown fixture kind {kind!r}")
     return _encode(path, [_to_bgr(f) for f in frames01])
