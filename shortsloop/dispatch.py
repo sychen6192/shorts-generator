@@ -21,6 +21,7 @@ class ClipSpec:
     image_dep: str                  # raw cell text; "" / "—" means none
     output_hint: str                # sheet's 輸出 cell, informational
     prompt: str | None = None
+    anchors: list[str] = field(default_factory=list)  # video's 視覺錨/角色錨 (verbatim)
 
 
 @dataclass
@@ -45,6 +46,26 @@ _FPS = re.compile(r"(?:fps\s*[=:]\s*(\d+(?:\.\d+)?))|(?:(\d+(?:\.\d+)?)\s*fps)",
 _NO_DEP = {"", "-", "–", "—", "——", "－", "−", "none", "n/a", "na", "無", "无",
            "無依賴", "无依赖", "無依赖", "无依賴"}
 _PAREN = re.compile(r"[（(][^）)]*[）)]")
+_VIDEO = re.compile(r"^##\s+Video\s*#?\s*(\d+)", re.I)
+# "視覺錨(一字不改):..." / "角色錨:..." — anchor phrases the rewrite must keep verbatim
+_ANCHOR = re.compile(r"^\s*[\u4e00-\u9fff]{0,4}錨[^:：]{0,20}[:：]\s*(.+?)\s*$")
+
+
+def _parse_anchors(lines: list[str]) -> dict[str, list[str]]:
+    anchors: dict[str, list[str]] = {}
+    video = None
+    for line in lines:
+        m = _VIDEO.match(line)
+        if m:
+            video = f"V{m.group(1)}"
+            continue
+        if line.startswith("## "):
+            video = None
+            continue
+        m = _ANCHOR.match(line)
+        if video and m:
+            anchors.setdefault(video, []).append(m.group(1))
+    return anchors
 
 
 def _clean(cell: str) -> str:
@@ -202,6 +223,7 @@ def parse_dispatch(path: str | Path) -> DispatchSheet:
         return sheet
 
     prompts = _parse_prompts(lines, sheet.errors)
+    anchors = _parse_anchors(lines)
 
     seen: dict[str, str] = {}
     for row in rows:
@@ -240,7 +262,8 @@ def parse_dispatch(path: str | Path) -> DispatchSheet:
                 continue
             spec = ClipSpec(clip_id=clip_id, video_id=video_id, mode=mode,
                             image_dep=image_dep, output_hint=output_hint,
-                            prompt=prompts.get(clip_id))
+                            prompt=prompts.get(clip_id),
+                            anchors=list(anchors.get(video_id, [])))
             if not spec.prompt:
                 sheet.errors.append(
                     f"{clip_id}: accepted T2V manifest row has no prompt block "

@@ -17,6 +17,7 @@ from conftest import write_thresholds
 from fake_comfy import serve_comfy
 from fake_judge import GOOD_SCORES, serve as serve_judge
 
+from shortsloop.doctor import fingerprint
 from shortsloop.policy import MOTION_PHRASES
 from shortsloop.runner import Runner, ship_gate
 
@@ -86,9 +87,9 @@ def make_env(tmp_path, comfy, judge_url, *, thresholds_over=None, policies_over=
         "rewrite": {"enabled": True, "model": "fake-text-model"},
         "paths": {"runs_dir": str(tmp_path / "runs")},
     }), encoding="utf-8")
-    # a passing doctor snapshot next to the config (the runner's doctor-gate)
-    (tmp_path / "doctor.json").write_text(json.dumps({"ok": True, "checks": []}),
-                                          encoding="utf-8")
+    # a passing doctor snapshot for THIS setup next to the config (the doctor-gate)
+    (tmp_path / "doctor.json").write_text(json.dumps(
+        {"ok": True, "checks": [], "fingerprint": fingerprint(config)}), encoding="utf-8")
     return {"config": config, "pipeline": pipeline, "thresholds": thr,
             "runs": tmp_path / "runs"}
 
@@ -236,7 +237,8 @@ def test_doctor_gate_refuses_without_passing_snapshot(clips, tmp_path):
 
         # supervised override works; then a passing snapshot works
         assert make_runner(small_sheet(tmp_path), env, skip_doctor=True).run() == 0
-        doctor_json.write_text(json.dumps({"ok": True, "checks": []}))
+        doctor_json.write_text(json.dumps({"ok": True, "checks": [],
+                                           "fingerprint": fingerprint(env["config"])}))
         assert make_runner(small_sheet(tmp_path), env).run() == 0
 
 
@@ -303,9 +305,12 @@ def test_ship_gate_rejects_everything_but_full_pass():
     assert not ship_gate({**ok, "layers_run": ["l1"]})[0]
     assert not ship_gate({**ok, "error": {"scope": "clip"}})[0]
     assert not ship_gate({**ok, "thresholds": {"calibrated": False}})[0]
-    assert ship_gate({**ok, "thresholds": {"calibrated": False}},
-                     allow_uncalibrated=True)[0]
+    assert not ship_gate({**ok, "thresholds": {"calibrated": "true"}})[0]   # strict bool
     assert not ship_gate(None)[0]
+    # plan §2.1: no override parameter exists — supervised uncalibrated runs encode
+    # to encoded_uncalibrated/ instead (test_runner_hardening)
+    import inspect
+    assert list(inspect.signature(ship_gate).parameters) == ["verdict"]
 
 
 def test_oom_recovery_frees_and_rerolls(clips, tmp_path):

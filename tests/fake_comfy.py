@@ -4,6 +4,8 @@ Scenario queue (one entry consumed per /prompt submission):
     {"fixture": "moving"}   -> job completes; /view serves that fixture's bytes
     {"error": "oom"}        -> history reports an execution_error (CUDA OOM text)
     {"hang": True}          -> job runs forever (client times out) until /interrupt
+    {"history_500": True}   -> /history answers HTTP 500 (the vendored client
+                               crashes mid-wait) while the job keeps running
     {"fixture": "moving", "extra_png": True}  -> also emits a PNG output first
 
 Execution is sequential like the real server: the oldest unfinished job is
@@ -86,6 +88,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({pid: {"status": {
                     "status_str": "error", "completed": False,
                     "messages": [["execution_interrupted", {"node_id": "4"}]]}}})
+                return
+            if job is not None and job["scenario"].get("history_500"):
+                self._json({"error": "boom"}, 500)     # client crashes; job keeps running
                 return
             if job is None or job.get("deleted") or job["scenario"].get("hang"):
                 self._json({})

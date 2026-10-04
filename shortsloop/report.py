@@ -64,14 +64,21 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
     md.append("")
     if status.startswith("HALTED"):
         md.append(f"> ⛔ **{status}** — {run_meta.get('halt_reason', '')}")
-        md.append("> No clips were encoded after the halt point. Verdicts below are "
-                  "only those produced while the instrument was healthy.")
+        md.append("> Nothing was generated or judged after the halt point. Clips that "
+                  "PASSED before it were still encoded (marked below); unfinished clips "
+                  "continue with `shortsloop run --resume <run_dir>`.")
+        md.append("")
+    if run_meta.get("allow_uncalibrated") and not run_meta.get("thresholds_calibrated"):
+        md.append("> ⚠️ **UNCALIBRATED supervised run** — thresholds are not signed off "
+                  "(Phase 0). PASS clips were encoded to `encoded_uncalibrated/` and are "
+                  "NOT shippable.")
         md.append("")
 
-    counts = {"passed": 0, "failed_final": 0, "skipped": 0, "error": 0, "pending": 0}
+    counts = {"passed": 0, "failed_final": 0, "skipped": 0, "error": 0, "unfinished": 0}
     for it in items:
-        counts[it.status if it.status in counts else "pending"] = \
-            counts.get(it.status if it.status in counts else "pending", 0) + 1
+        key = it.status if it.status in counts else "unfinished"
+        counts[key] += 1
+    shipped = sum(1 for it in items if it.status == "passed" and it.encoded_path)
     total_attempts = sum(it.attempts_used for it in items)
 
     md.append("## Run summary")
@@ -82,9 +89,10 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
     md.append(f"| Dispatch | `{run_meta.get('dispatch_path', '?')}` "
               f"(sha256 `{str(run_meta.get('dispatch_sha256'))[:12]}…`) |")
     md.append(f"| Clips accepted / skipped at intake | {len(items)} / {len(skipped_rows)} |")
-    md.append(f"| Verdicts | ✅ {counts['passed']} passed · ❌ {counts['failed_final']} "
-              f"failed (caught & bounded) · ⏭ {counts['skipped']} skipped · "
-              f"⚠️ {counts['error']} error |")
+    md.append(f"| Verdicts | ✅ {counts['passed']} passed ({shipped} encoded) · "
+              f"❌ {counts['failed_final']} failed (caught & bounded) · "
+              f"⏭ {counts['skipped']} skipped · ⚠️ {counts['error']} error · "
+              f"⏳ {counts['unfinished']} unfinished |")
     md.append(f"| Attempts used | {total_attempts} "
               f"(cap {budget.get('max_attempts', '?')}/clip — respected: "
               f"{'YES' if budget.get('cap_respected', True) else 'NO'}) |")
@@ -92,6 +100,10 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
     md.append(f"| Wall clock | {_fmt_min(budget.get('wall_s'))} of "
               f"{_fmt_min(budget.get('wall_budget_s'))} budget — "
               f"{'TRIPPED' if budget.get('wall_tripped') else 'within budget'} |")
+    if "disk_min_free_gb" in budget:
+        md.append(f"| Disk floor | {budget['disk_min_free_gb']} GB — "
+                  + (f"TRIPPED: {budget['disk_tripped']}" if budget.get("disk_tripped")
+                     else "never reached") + " |")
     md.append(f"| Generation / judge time | {_fmt_min(budget.get('gen_s'))} / "
               f"{_fmt_min(budget.get('judge_s'))} |")
     gen = run_meta.get("gen_params") or {}
@@ -117,21 +129,26 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
     by_video: dict[str, list] = {}
     for it in items:
         by_video.setdefault(it.spec.video_id, []).append(it)
+    intake_skips: dict[str, list[str]] = {}
+    for row in skipped_rows:
+        vid = str(row["clip_id"]).split("C")[0].split()[0]
+        intake_skips.setdefault(vid, []).append(row["clip_id"])
 
     md.append("## Videos")
     md.append("")
-    for vid in sorted(by_video):
-        group = by_video[vid]
+    for vid in sorted(set(by_video) | set(intake_skips)):
+        group = by_video.get(vid, [])
+        skipped_here = intake_skips.get(vid, [])
         passed = [i for i in group if i.status == "passed"]
-        line = f"- **{vid}**: {len(passed)}/{len(group)} clips passed"
-        misses = [i for i in group if i.status != "passed"]
-        if misses:
-            det = ", ".join(
-                f"{i.spec.clip_id} {i.status}"
-                + (f" ({'/'.join(i.last_classes)})" if i.last_classes else "")
-                + (f" [{i.skip_reason}]" if i.skip_reason else "")
-                for i in misses)
-            line += f" — {det}"
+        line = (f"- **{vid}**: {len(passed)}/{len(group) + len(skipped_here)} "
+                f"clips passed")
+        det = [f"{i.spec.clip_id} {i.status}"
+               + (f" ({'/'.join(i.last_classes)})" if i.last_classes else "")
+               + (f" [{i.skip_reason}]" if i.skip_reason else "")
+               for i in group if i.status != "passed"]
+        det += [f"{cid} skipped(v2_mode)" for cid in skipped_here]
+        if det:
+            line += " — " + ", ".join(det)
         md.append(line)
     md.append("")
 
@@ -151,6 +168,9 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
             except ValueError:
                 pass
             md.append(f"- encoded: `{enc}`")
+        elif it.status == "passed" and not getattr(it, "encode_error", None):
+            md.append("- PASSED — **not encoded** (run stopped before persist; "
+                      "`--resume` encodes it)")
         if getattr(it, "encode_error", None):
             md.append(f"- ⚠️ **encode failed after PASS**: {it.encode_error} — clip "
                       f"NOT shipped; raw file kept")
@@ -160,11 +180,14 @@ def render(run_dir: Path, run_meta: dict, items: list, budget: dict,
             md.append("")
             md.append("| attempt | seed | steps | outcome | classes | notes |")
             md.append("|---|---|---|---|---|---|")
+            base_steps = run_meta.get("base_steps") or "?"
             for a in it.attempt_history:
+                note = a.get("notes") or a.get("note") or a.get("reroll_action") or "—"
+                note = " ".join(str(note).split()).replace("|", "¦")[:200]
                 md.append(
-                    f"| {a['attempt']} | `{a.get('seed')}` | {a.get('steps') or 4} "
+                    f"| {a['attempt']} | `{a.get('seed')}` | {a.get('steps') or base_steps} "
                     f"| {a.get('status')} | {'/'.join(a.get('failure_classes') or []) or '—'} "
-                    f"| {a.get('note', '') or a.get('reroll_action', '') or '—'} |")
+                    f"| {note} |")
             md.append("")
             for a in it.attempt_history:
                 if a.get("contact_sheet"):

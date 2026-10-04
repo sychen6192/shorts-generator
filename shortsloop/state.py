@@ -206,3 +206,26 @@ def fold(log: RunLog) -> dict[str, ClipState]:
         if info["stage"] == "in_flight":
             s.in_flight = info
     return clips
+
+
+def active_seconds(events: list[dict]) -> float:
+    """Wall-clock the runner was actually working, summed over sessions (a new
+    session starts at each `schedule enter` — the original run and every
+    --resume). Hard rule 5's budget is whole-run: a resume is charged for it,
+    but not for the hours the machine sat crashed in between."""
+    total, first, last = 0.0, None, None
+    for ev in events:
+        ts = ev.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        new_session = ev.get("stage") == "schedule" and (
+            ev.get("event") == "enter" or (ev.get("data") or {}).get("data_resumed"))
+        if new_session and first is not None:
+            total += last - first
+            first = None
+        if first is None:
+            first = ts
+        last = ts
+    if first is not None:
+        total += last - first
+    return total

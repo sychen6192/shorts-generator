@@ -53,3 +53,13 @@ def test_fold_survives_torn_last_line(tmp_path):
     folded = fold(log)
     assert folded["A"].status == "passed"
     assert "B" not in folded
+
+
+def test_active_seconds_sums_sessions_not_downtime():
+    from shortsloop.state import active_seconds
+    ev = lambda ts, stage="claim", event="enter", **d: {  # noqa: E731
+        "ts": ts, "stage": stage, "event": event, "data": d}
+    events = [ev(100, "schedule", "enter"), ev(150), ev(400),          # 300 s
+              ev(10_000, "schedule", "enter"), ev(10_050)]             # +50 s
+    assert active_seconds(events) == 350
+    assert active_seconds([]) == 0

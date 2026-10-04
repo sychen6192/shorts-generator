@@ -27,7 +27,8 @@ def _attempts(run_dir):
 
 
 def test_halt_before_judge_logs_attempts_and_resume_does_not_regenerate(clips, tmp_path):
-    with serve_comfy(fixture_paths=clips, never_frees=True) as comfy, \
+    # the pre-generation handoff frees fine; the judge handoff finds Wan stuck
+    with serve_comfy(fixture_paths=clips, free_results=[28.0, 4.0]) as comfy, \
          serve_judge() as (judge, jurl):
         env = make_env(tmp_path, comfy, jurl,
                        policies_over={"vram_handoff": {"free_min_gb": 20,
@@ -46,7 +47,6 @@ def test_halt_before_judge_logs_attempts_and_resume_does_not_regenerate(clips, t
         subs = len(comfy.submissions)
         assert subs == 2
 
-        comfy.never_frees = False
         resumed = make_runner(small_sheet(tmp_path, n_clips=2), env,
                               resume_dir=first.run_dir)
         assert resumed.run() == 0
