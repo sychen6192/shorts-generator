@@ -18,11 +18,13 @@ import yaml
 from conftest import write_thresholds
 from fake_comfy import serve_comfy
 from fake_judge import serve as serve_judge
+from fake_openai import serve_openai
 
 from shortsloop import doctor, gpu, l2
 from shortsloop.comfy import ComfyClient
 from shortsloop.errors import InfraError
 from shortsloop.doctor import run_doctor
+from shortsloop.judge.base import RetryableJudgeError
 from shortsloop.l2 import JUDGE_RESPONSE_SCHEMA
 
 DATA = Path(__file__).parent / "data"
@@ -35,9 +37,16 @@ WORKFLOW_MODELS = {
     "vae": ["wan_2.1_vae.safetensors"],
 }
 
+# The one 32 GB card both fakes share: idle after ComfyUI's /free = 28 GB (the
+# FakeComfy default); an 8B VLM loaded for the probes leaves 22 GB — MORE than the
+# judge-direction free_min_gb (20), so only the stricter judge->generation
+# threshold gen_free_min_gb (26) can tell a resident VLM from an idle card.
+VLM_LOADED_FREE_GB = 22.0
+HANDOFF = {"free_min_gb": 20, "gen_free_min_gb": 26, "wait_timeout_s": 5}
+
 
 def _cfg(tmp_path, comfy_host, judge_url, *, workflow=None, judge=None,
-         rewrite=None, runs_dir=None, handoff=None) -> Path:
+         rewrite=None, runs_dir=None, handoff=None, judge_policy=None) -> Path:
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump({
         "comfy": {"host": comfy_host,
@@ -47,13 +56,43 @@ def _cfg(tmp_path, comfy_host, judge_url, *, workflow=None, judge=None,
         "rewrite": rewrite if rewrite is not None else {"model": "qwen3:8b"},
         "paths": {"runs_dir": str(runs_dir or tmp_path)},
     }), encoding="utf-8")
-    (tmp_path / "pipeline.yaml").write_text(yaml.safe_dump({
-        "policies": {"disk_min_free_gb": 1,
-                     "vram_handoff": handoff or {"free_min_gb": 20,
-                                                 "wait_timeout_s": 5}}}),
-        encoding="utf-8")
+    policies = {"disk_min_free_gb": 1, "vram_handoff": handoff or dict(HANDOFF)}
+    if judge_policy is not None:                 # what the NIGHTLY checker uses
+        policies["judge"] = judge_policy
+    (tmp_path / "pipeline.yaml").write_text(yaml.safe_dump({"policies": policies}),
+                                            encoding="utf-8")
     write_thresholds(tmp_path / "thresholds.yaml", calibrated=False)
     return cfg
+
+
+def _vlm_on_card(comfy, judge, free_gb: float = VLM_LOADED_FREE_GB) -> None:
+    """Both fakes share one card. A vision call loads the VLM (a separate process):
+    free VRAM drops to `free_gb` and stays there until ComfyUI's next /free, whose
+    outcome `free_results` scripts — the default (28 GB, idle) models a VLM that
+    really left after its unload; a scripted low value models one that did not
+    (ComfyUI's /free cannot evict another process's model)."""
+    real = judge.content
+
+    def content():
+        comfy.vram_free_gb = min(comfy.vram_free_gb, free_gb)
+        return real()
+    judge.content = content
+
+
+def _wrap_replies(judge, fmt: str) -> None:
+    """Every judge reply becomes fmt with BODY replaced by the real reply."""
+    real = judge.content
+    judge.content = lambda: fmt.replace("BODY", real())
+
+
+def _slow_rubric(monkeypatch, judge, sleep_s: float) -> None:
+    """Only the 8-frame rubric call is slow (the color probes stay fast)."""
+    real = l2.run_l2
+
+    def slow(*a, **k):
+        judge.sleep_s = sleep_s
+        return real(*a, **k)
+    monkeypatch.setattr(l2, "run_l2", slow)
 
 
 def _doctor(tmp_path, cfg, do_free=True):
@@ -95,6 +134,7 @@ def test_doctor_all_green(clips, tmp_path, monkeypatch):
     with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
          serve_judge() as (judge, jurl):
         judge.probe_answers = ["red", "blue"]         # judge really sees the images
+        _vlm_on_card(comfy, judge)
         unloads = _spy_unload(monkeypatch, judge)
         code, snap = _run(tmp_path, comfy, jurl)
     assert code == 0 and snap["ok"] is True and snap["status"] == "complete"
@@ -106,6 +146,13 @@ def test_doctor_all_green(clips, tmp_path, monkeypatch):
     assert comfy.free_times[0] < judge.chat_times[0]
     assert judge.chat_calls == 3                       # 2 color probes + 1 L2 call
     assert unloads == [3] and judge.generate_calls >= 1
+    # the judge->generation handoff is the runner's: unload, /free, verify against
+    # gpu.gen_free_min_gb — with BOTH readings on record (loaded vs. unloaded)
+    assert comfy.free_calls == 2 and comfy.free_times[1] > judge.chat_times[-1]
+    unload = _check(snap, "judge.unload")
+    assert unload["vram"] == {"loaded_free_gb": 22.0, "unloaded_free_gb": 28.0,
+                              "gen_free_min_gb": 26.0}
+    assert "22.0" in unload["detail"] and "28.0" in unload["detail"]
 
 
 def test_l2_dryrun_is_the_real_8_frame_nightly_call(clips, tmp_path):
@@ -113,6 +160,7 @@ def test_l2_dryrun_is_the_real_8_frame_nightly_call(clips, tmp_path):
     with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
          serve_judge() as (judge, jurl):
         judge.probe_answers = ["red", "blue"]
+        _vlm_on_card(comfy, judge)
         code, snap = _run(tmp_path, comfy, jurl)
         payload = judge.last_chat_payload               # the L2 dry-run call
     assert code == 0
@@ -136,20 +184,68 @@ def test_l2_dryrun_fails_on_schema_invalid_reply(clips, tmp_path):
     assert dry["level"] == "FAIL" and "unusable" in dry["detail"]
 
 
-def test_l2_dryrun_fails_on_timeout(clips, tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_timeout, pipeline_timeout, ok", [
+    (30, 1, False),    # config.yaml generous, the nightly's pipeline.yaml is not
+    (1, 30, True),     # config.yaml tight, but the nightly checker never uses it
+])
+def test_l2_dryrun_is_timed_against_pipeline_yaml_judge_timeout(
+        clips, tmp_path, monkeypatch, config_timeout, pipeline_timeout, ok):
+    """The nightly checker's judge timeout/retries come from pipeline.yaml (plan §2.8
+    amended; settings.effective_judge_cfg). Doctor must certify THOSE values and
+    send the operator to that file — config.yaml's judge.timeout_s only applies to
+    a standalone `shortsloop-check`."""
     with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
          serve_judge() as (judge, jurl):
         judge.probe_answers = ["red", "blue"]
-        real = l2.run_l2
-
-        def slow_rubric(*a, **k):                    # only the 8-frame call is slow
-            judge.sleep_s = 1.5
-            return real(*a, **k)
-        monkeypatch.setattr(l2, "run_l2", slow_rubric)
-        code, snap = _run(tmp_path, comfy, jurl, judge={"timeout_s": 1})
-    assert code == 2
+        _slow_rubric(monkeypatch, judge, 1.5)
+        code, snap = _run(tmp_path, comfy, jurl, judge={"timeout_s": config_timeout},
+                          judge_policy={"timeout_s": pipeline_timeout, "retries": 0})
     assert _check(snap, "judge.vision")["ok"] is True
+    dry = _check(snap, "judge.l2_dryrun")
+    assert dry["ok"] is ok, dry["detail"]
+    assert "pipeline.yaml policies.judge.timeout_s" in dry["detail"]
+    if not ok:
+        assert code == 2
+
+
+def test_l2_dryrun_uses_pipeline_yaml_retries(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge(scenario="garbage") as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]         # color probe fine, rubric not
+        code, snap = _run(tmp_path, comfy, jurl, judge={"retries": 3},
+                          judge_policy={"retries": 0})
     assert _check(snap, "judge.l2_dryrun")["level"] == "FAIL"
+    assert judge.chat_calls == 2 + 1     # 2 color probes + ONE rubric try (retries 0)
+
+
+def test_latency_warning_points_at_pipeline_yaml(clips, tmp_path, monkeypatch):
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        _slow_rubric(monkeypatch, judge, 1.6)
+        code, snap = _run(tmp_path, comfy, jurl, judge={"timeout_s": 600},
+                          judge_policy={"timeout_s": 3})
+    assert _check(snap, "judge.l2_dryrun")["ok"] is True
+    warn = _check(snap, "judge.latency")
+    assert warn["level"] == "WARN"
+    assert "pipeline.yaml policies.judge.timeout_s" in warn["detail"]
+
+
+@pytest.mark.parametrize("policies", [{"judge": 5}, {"vram_handoff": [20]}])
+def test_malformed_pipeline_yaml_is_a_fail_not_a_crash(clips, tmp_path, policies):
+    """The runner refuses this pipeline.yaml (settings.load_policies); doctor must
+    say so as a FAIL — not report it loaded, not crash a later check group."""
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        cfg = _cfg(tmp_path, comfy.host, jurl)
+        (tmp_path / "pipeline.yaml").write_text(
+            yaml.safe_dump({"policies": policies}), encoding="utf-8")
+        code, snap = _doctor(tmp_path, cfg)
+    assert code == 2 and snap["ok"] is False and snap["status"] == "complete"
+    pipe = _check(snap, "pipeline")
+    assert pipe["level"] == "FAIL" and "must be a mapping" in pipe["detail"]
+    assert not [c["name"] for c in snap["checks"] if c["name"].endswith(".crash")]
 
 
 def test_doctor_catches_blind_judge(clips, tmp_path):
@@ -290,7 +386,9 @@ def test_no_free_on_an_empty_gpu_still_probes_but_snapshot_not_ok(clips, tmp_pat
 
 
 def test_vlm_that_stays_resident_after_unload_fails(clips, tmp_path, monkeypatch):
-    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+    # unload is a no-op and ComfyUI's /free cannot evict another process's VLM
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS,
+                     free_results=[28.0, 4.0]) as comfy, \
          serve_judge() as (judge, jurl):
         judge.probe_answers = ["red", "blue"]
         real = l2.run_l2
@@ -304,6 +402,138 @@ def test_vlm_that_stays_resident_after_unload_fails(clips, tmp_path, monkeypatch
     assert code == 2
     assert _check(snap, "judge.unload")["level"] == "FAIL"
     assert judge.generate_calls >= 1                  # the unload was requested
+
+
+def test_vlm_resident_after_unload_fails_against_gen_free_min_gb(clips, tmp_path):
+    """The runner's judge->generation check uses gpu.gen_free_min_gb (26 here), not
+    free_min_gb (20). A VLM still leaving 22 GB after its unload clears 20 but would
+    halt the night at 26 — doctor must verify against the runner's threshold."""
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS,
+                     free_results=[28.0, VLM_LOADED_FREE_GB]) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        _vlm_on_card(comfy, judge)
+        code, snap = _run(tmp_path, comfy, jurl,
+                          handoff={**HANDOFF, "wait_timeout_s": 1})
+    assert code == 2 and snap["ok"] is False
+    unload = _check(snap, "judge.unload")
+    assert unload["level"] == "FAIL" and "26" in unload["detail"]
+    assert unload["vram"]["unloaded_free_gb"] == 22.0
+    assert judge.generate_calls >= 1                  # the unload was requested
+
+
+def test_resident_vlm_that_clears_the_generation_threshold_fails(clips, tmp_path):
+    """Shipped-default shape (no gen_free_min_gb): an 8B VLM still loaded leaves
+    22 GB free, more than free_min_gb 20, so the runner's judge->generation check
+    could not tell a resident judge from an idle card. Doctor reads free VRAM while
+    the VLM is loaded and FAILs, printing both readings and a value between them."""
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        _vlm_on_card(comfy, judge)
+        code, snap = _run(tmp_path, comfy, jurl,
+                          handoff={"free_min_gb": 20, "wait_timeout_s": 1})
+    assert code == 2 and snap["ok"] is False
+    unload = _check(snap, "judge.unload")
+    assert unload["level"] == "FAIL"
+    assert unload["vram"] == {"loaded_free_gb": 22.0, "unloaded_free_gb": 28.0,
+                              "gen_free_min_gb": 20.0}
+    assert "22.0" in unload["detail"] and "28.0" in unload["detail"]
+    assert "vram_handoff.gen_free_min_gb: 25" in unload["detail"]
+
+
+def test_unload_check_needs_a_reading_with_the_vlm_loaded(clips, tmp_path):
+    """No judge reply = no proof the VLM was in VRAM when doctor read it: the
+    loaded-vs-idle comparison is unverified, which is a FAIL — never an OK."""
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge(sleep_s=1.5) as (judge, jurl):  # every judge call times out
+        code, snap = _run(tmp_path, comfy, jurl,
+                          judge_policy={"timeout_s": 1, "retries": 0})
+    assert code == 2
+    unload = _check(snap, "judge.unload")
+    assert unload["level"] == "FAIL" and "not verified" in unload["detail"]
+
+
+def test_openai_compat_without_unload_url_fails_before_loading_the_vlm(clips,
+                                                                      tmp_path):
+    """settings.judge_unload_problem: such a judge cannot be evicted before a Wan
+    wave (the runner refuses it). Doctor FAILs it at once and never loads it."""
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_openai() as (srv, ourl):
+        code, snap = _doctor(tmp_path, _cfg(tmp_path, comfy.host, ourl,
+                                            judge={"adapter": "openai_compat"},
+                                            rewrite={"enabled": False}))
+    assert code == 2 and snap["ok"] is False
+    unload = _check(snap, "judge.unload")
+    assert unload["level"] == "FAIL" and "unload_url" in unload["detail"]
+    assert srv.chat_calls == 0                         # never load what can't leave
+    assert "not run" in _check(snap, "judge.vision")["detail"]
+    assert _check(snap, "judge.l2_dryrun")["level"] == "FAIL"
+
+
+def test_card_smaller_than_the_generation_threshold_fails(clips, tmp_path):
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        code, snap = _run(tmp_path, comfy, jurl,
+                          handoff={"free_min_gb": 20, "gen_free_min_gb": 40,
+                                   "wait_timeout_s": 1})
+    assert code == 2
+    card = _check(snap, "comfy.gpu")
+    assert card["level"] == "FAIL" and "gen_free_min_gb" in card["detail"]
+
+
+# ---- the vision probe parses replies exactly like the nightly L2 parser ------------
+
+class _ReplyAdapter:
+    """Answers the two color probes correctly, wrapped in `fmt` (BODY = the JSON)."""
+    name, model = "stub", "stub-vl"
+
+    def __init__(self, fmt: str):
+        self.fmt, self.calls = fmt, 0
+
+    def judge(self, frames, system, user, schema, timeout_s):
+        color = ("red", "blue")[self.calls]
+        self.calls += 1
+        return self.fmt.replace("BODY", json.dumps({"dominant_color": color}))
+
+
+@pytest.mark.parametrize("fmt", [
+    "BODY",
+    "```json\nBODY\n```",
+    "<think>the square is red</think>\nBODY",
+    "<think>checking</think>\n```json\nBODY\n```",
+    "the image is mostly red</think>BODY",       # opening tag lived in the template
+    "Sure! Here is the answer: BODY",            # prose around the JSON
+    "BODY\nActually, I am not sure.",            # JSON, then a correction
+    "<think>still reasoning... BODY",            # unterminated reasoning
+])
+def test_vision_probe_parses_exactly_like_the_nightly_l2_parser(fmt):
+    try:
+        l2._load_json(fmt.replace("BODY", '{"dominant_color": "red"}'))
+        nightly_accepts = True
+    except RetryableJudgeError:
+        nightly_accepts = False
+    doc = doctor.Doctor()
+    doctor._probe_vision(doc, _ReplyAdapter(fmt), {"timeout_s": 30})
+    vision = doc.checks[-1]
+    assert vision["name"] == "judge.vision"
+    assert vision["ok"] is nightly_accepts, vision["detail"]
+    if not nightly_accepts:            # a parse failure is not a broken sidecar
+        assert "switch judge.adapter" not in vision["detail"]
+
+
+def test_doctor_green_for_a_judge_whose_wrappers_the_nightly_tolerates(clips,
+                                                                      tmp_path):
+    with serve_comfy(fixture_paths=clips, models=WORKFLOW_MODELS) as comfy, \
+         serve_judge() as (judge, jurl):
+        judge.probe_answers = ["red", "blue"]
+        _wrap_replies(judge, "<think>checking the frames</think>\n```json\nBODY\n```")
+        _vlm_on_card(comfy, judge)
+        code, snap = _run(tmp_path, comfy, jurl)
+    assert _check(snap, "judge.vision")["ok"] is True
+    assert _check(snap, "judge.l2_dryrun")["ok"] is True
+    assert code == 0 and snap["ok"] is True
 
 
 # ---- "could not verify" is a FAIL where the runner depends on it -------------------

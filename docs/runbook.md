@@ -25,7 +25,13 @@ Judge model: `ollama pull qwen3-vl:8b-instruct` (or the closest 8B-class VL
 build available). If Ollama's vision sidecar is broken for your model family —
 the doctor's vision probe will tell you — switch `judge.adapter:
 openai_compat` and point `base_url` at a llama.cpp `llama-server` running the
-GGUF + mmproj pair. No code changes.
+GGUF + mmproj pair. No code changes, but `openai_compat` **requires**
+`judge.unload_url` (e.g. llama-swap's `/unload`): without a way to evict the VLM
+before a Wan wave, the runner refuses to start and doctor FAILs `judge.unload`.
+
+Judge timeout/retries for the nightly run live in `pipeline.yaml`
+(`policies.judge.timeout_s` / `retries`); `config.yaml`'s `judge.timeout_s` only
+applies to a standalone `shortsloop-check`.
 
 ## 1. Doctor — executable discovery (repeat after any env change)
 
@@ -38,12 +44,15 @@ No `config.yaml` yet? Doctor writes one there as a skeleton (a copy of
 
 Verifies, in this order:
 
+- **pipeline.yaml** loaded exactly as the runner loads it; a file the runner
+  would refuse (e.g. `policies.judge` not a mapping) is a FAIL. Every judge and
+  VRAM check below uses these values — the nightly's, not config.yaml's.
 - **ffmpeg/ffprobe** — absolute paths are recorded in `doctor.json` (`tools`).
   Cron does not inherit your shell's PATH: doctor prints the `PATH=…` line the
   crontab needs (§4) and warns when the binaries live outside cron's default
   `/usr/bin:/bin`.
 - **ComfyUI** reachable, a real CUDA GPU (no devices, CPU mode, or a card smaller
-  than `vram_handoff.free_min_gb` = FAIL), queue state.
+  than `vram_handoff.free_min_gb` / `gen_free_min_gb` = FAIL), queue state.
 - **Workflow**: API format; a dry run (`--dump`, nothing queued) proves prompt,
   seed, size, length and steps are patchable at the nightly 720x1280 · 81 frames ·
   16 fps · steps 8; every model file its loader nodes reference exists **on the
@@ -51,19 +60,35 @@ Verifies, in this order:
   GGUF loaders) is a FAIL — doctor cannot vouch for those files.
 - **VRAM handoff**: `/free`, then free VRAM verified via `/system_stats`. Only then
   does the judge VLM load — hard rule 3 applies to the doctor's own probes too.
-- **Judge**: reachable, model installed, a **two-call color vision probe** with
-  strict JSON (catches a judge that cannot actually see), then an **L2 dry run** —
-  the real nightly call: 8 frames of a synthetic 720x1280 clip + the rubric + the
-  strict response schema, parsed within `judge.timeout_s` (proves `num_ctx` fits 8
-  images and the model build handles them; WARN if it took over half the timeout).
-- **Judge unload**: the VLM (and rewrite LLM) are unloaded right after the probes
-  and VRAM is re-verified. A judge that cannot unload (`openai_compat` without
-  `judge.unload_url`) FAILs here instead of halting the night at the first
-  judge→generation handoff.
+- **Judge**: configured exactly as the nightly checker gets it (config.yaml's
+  `judge` section with `pipeline.yaml` `policies.judge.timeout_s` / `retries`).
+  Reachable, model installed, a **two-call color vision probe** (catches a judge
+  that cannot actually see), then an **L2 dry run** — the real nightly call: 8
+  frames of a synthetic 720x1280 clip + the rubric + the strict response schema,
+  answered within `pipeline.yaml` `policies.judge.timeout_s` (proves `num_ctx` fits
+  8 images and the model build handles them; WARN if it took over half the
+  timeout — raise it in `pipeline.yaml`, not `config.yaml`). Both probes parse
+  replies with the nightly L2 parser: a JSON object, optionally wrapped in one
+  `<think>…</think>` block and one ```` ``` ```` fence — nothing else.
+- **Judge unload** — the nightly's own judge→generation handoff, proven able to
+  catch a resident judge:
+  - `openai_compat` without `judge.unload_url` FAILs at once; its probes are not
+    run (never load a VLM that cannot be evicted).
+  - Doctor reads free VRAM **while the VLM is still loaded** (right after the
+    probes), then unloads the VLM + rewrite LLM, `/free`s ComfyUI and verifies
+    free VRAM ≥ `vram_handoff.gen_free_min_gb` (default: `free_min_gb`) — the
+    threshold the runner uses before every Wan wave.
+  - FAIL if VRAM does not come back (the night would halt at its first wave), or
+    if the loaded reading already clears that threshold: then the runner could not
+    tell a resident judge from an idle card (a resident 8B VLM can leave more than
+    24 GB free on a 32 GB card). The detail and `doctor.json` (`vram`) show both
+    readings and suggest a `gen_free_min_gb` between them — set it in
+    `pipeline.yaml` and re-run doctor.
+  - No judge reply at all = the loaded reading proves nothing = FAIL.
 - **Rewrite model** on the server the rewrite actually calls (`rewrite.base_url`,
   else the judge's Ollama, else local Ollama) — warning only.
 - **Disk** headroom on the filesystem that will hold `paths.runs_dir` (even before
-  it exists) · pipeline policies · thresholds state.
+  it exists) · thresholds state.
 
 Writes `doctor.json` next to `config.yaml`. The file is overwritten with
 `ok: false` (`status: "in progress"`) the moment doctor starts; only a run that
