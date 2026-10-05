@@ -161,7 +161,9 @@ Verifies, in this order:
 Writes `doctor.json` next to `config.yaml` (not gitignored — exclude it once, §0).
 It is overwritten with `ok: false` (`status: "in progress"`) the moment doctor
 starts; only a run that completes with no FAIL writes `ok: true` (`ALL CHECKS
-PASSED`, exit 0; else exit 2) — a crash or Ctrl-C leaves the `ok: false` placeholder.
+PASSED`, exit 0; else exit 2). A crash or Ctrl-C rewrites it with `ok: false`
+(`status: crashed` / `interrupted`) and a kill leaves the `in progress` placeholder —
+never an older green snapshot.
 WARNs (`comfy.queue`, `cron.path`, `rewrite.model`, `judge.latency`, `thresholds`
 before sign-off) do not block `ok: true` — read them anyway. A busy queue is only a
 WARN itself, but if it does not drain within `vram_handoff.wait_timeout_s` (180 s)
@@ -236,7 +238,9 @@ before re-running).
 #     re-run doctor) or a misspelled adapter that does have an unload_url
 #     (`unknown judge adapter`), judge unreachable / model not pulled, the VRAM
 #     handoff failed, or the judge died mid-wave (scored clips are kept — re-run
-#     to continue).
+#     to continue). Exit 1 with `RetryableJudgeError` in the traceback: the judge
+#     hung (>20 s) or answered non-JSON on its model list, before or during the
+#     wave — check Ollama / llama-swap and re-run; scored clips are kept.
 #     Scores are keyed by clip+prompt sha and judge model+digest; a clip the
 #     judge cannot evaluate is recorded (a runtime ERROR) and skipped on re-run —
 #     to re-score after fixing the judge, move calibration/l2_scores.jsonl aside.
@@ -255,8 +259,9 @@ before re-running).
 #     combined L1+L2 decision. stdout must say `TEST (L1+L2)`, not `L1 only`.
 #     ⚠️ Fallback floors — the report says `⚠️ **L2 FLOORS ARE A FALLBACK — …`,
 #     stdout `[calibrate-tune] WARNING: L2 floors are a FALLBACK, not a fit — …`,
-#     and provenance.l2_floors_fallback is non-null (`grep -i fallback`): the
-#     judge fails more labeled-pass clips than the 20% false-fail cap under EVERY
+#     and provenance.l2_floors_fallback is non-null (the key is always there,
+#     `null` when fine). Check: `grep -n FALLBACK calibration/tuning_report.md`
+#     prints nothing = OK. A fallback means the judge fails more labeled-pass clips than the 20% false-fail cap under EVERY
 #     floor (a dimension scored 1, or all N/A) — the clips are listed. The floors are then the least-bad combination
 #     (no false-fail beyond those clips), not a fit. The judge disagrees with
 #     your labels: re-check those clips, or escalate as below.
@@ -445,7 +450,7 @@ separately: the floor only watches `paths.runs_dir`.
 | `run` exits 1 with a Python traceback | Not a refusal: config.yaml has the wrong shape (top level, `comfy:` or `judge:` not a mapping) or `runs_dir` cannot be created; or, with signed-off thresholds, the judge hung (>20 s) or returned non-JSON at the start-up build check (`RetryableJudgeError` in the traceback — check Ollama / llama-swap). Run doctor — it reports these as FAIL (`judge.model` for the judge). |
 | `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: ComfyUI unreachable (even at start — the run dir already exists), submit rejected, queue busy or a stuck job that won't clear, a job saving other than one video; VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts); judge down or its build changed; 3 consecutive generation failures; `policies.judge.infra_escalation_after` (default 2) consecutive clip-scope judge errors; checker hung or contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix (judge errors: L2 ERROR row below), then resume (§4). |
 | `run` exits 3, report says HALTED(interrupted) / HALTED(crash) | Ctrl-C / `kill -INT`, or a runner exception (traceback on stderr). Same clean halt and resume command — resume (§4). |
-| cron.log has no final `[shortsloop] <STATUS>: n/m clips passed · report: …` line for that night (and no `REFUSING TO RUN`), and there is no report.md | Killed outright (SIGTERM/SIGKILL, OOM-killer, reboot) — resume by hand (§4) — or cron never fired (`grep CRON /var/log/syslog`, or `journalctl -u cron` where there is no syslog file: a split entry, an unescaped `%`). |
+| cron.log has no final `[shortsloop] <STATUS>: n/m clips passed · report: …` line for that night (and no `REFUSING TO RUN`), and there is no report.md | Killed outright (SIGTERM/SIGKILL, OOM-killer, reboot) — resume by hand (§4) — or cron never fired (`grep CRON /var/log/syslog`, or `journalctl -u cron` where there is no syslog file: a split entry, an unescaped `%`). If cron.log ends in a Python traceback instead, see the exit-1 row: nothing was created, so there is nothing to resume — fix, run doctor, start a fresh run (or let the next night run). |
 | Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` (exit 0) | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
 | HALTED(infra): `N consecutive clip-scope judge errors`, or clips ERROR at L2 | `doctor` → vision probe + 8-frame L2 dry run; timeouts → raise `policies.judge.timeout_s` (`judge.latency`), re-run doctor. Ollama vision broken ⇒ switch adapters as in §0 (`openai_compat` behind llama-swap, with `judge.unload_url`). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |

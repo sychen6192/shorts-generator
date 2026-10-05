@@ -7,10 +7,11 @@ budgets → encode only the survivors into silent 1080x1920 QC MP4s → wake up 
 morning report instead of a review queue.
 
 ```
+# run from the repo root as .venv/bin/shortsloop … / .venv/bin/shortsloop-check …
+# (the venv is never activated)
 shortsloop-check clip.mp4 --prompt-file prompt.txt --json verdict.json
 # exit 0 PASS · 1 FAIL · 2 ERROR — the ONLY authority on clip quality
 
-# from the repo root as .venv/bin/shortsloop … (the venv is never activated)
 shortsloop doctor            # verify the workstation (writes doctor.json)
 shortsloop calibrate-batch   # Phase 0: ~40 draft clips spanning good and bad
 shortsloop label             # you label them (keyboard web UI, ~15 min)

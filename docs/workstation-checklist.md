@@ -385,6 +385,7 @@ $EDITOR config.yaml                               # 改 judge.model
   - judge 連不上，或模型沒 pull。
   - 判讀前 VRAM 驗證不過。
   - judge 在中途掛掉。已經評好的分數會保留，重跑會接著評。
+- exit 1，traceback 裡有 `RetryableJudgeError`：judge 在列模型清單時超過 20 秒沒回，或回的不是 JSON（打分前或打分中都可能）。檢查 Ollama／llama-swap 後重跑，已評好的分數會保留。
 - 不加 `--with-l2` 的 `calibrate-tune` 會沿用 `l2_scores.jsonl` 裡同一個模型名稱最新的分數。所以只要重新 pull 過 judge，就一定要加 `--with-l2`。
 
 ### 4d. calibrate-tune --approve 🛑 人工閘門 2
@@ -583,7 +584,7 @@ kill -INT <PID>                # 等同 Ctrl-C：HALTED(interrupted)，寫出 re
 | ↳ `another shortsloop process holds …/.shortsloop.lock` | 已經有別的程序在跑 | `pgrep -af '\.venv/bin/shortsloop'` 找出是誰，等它結束（`flock -n <runs_dir>/.shortsloop.lock true` exit 0 就是放開了）；**不要刪鎖檔** |
 | ↳ `disk: X GB free … < 20 GB floor` | 磁碟空間不夠 | 依第 7 步「磁碟保留」清出空間 |
 | ↳ `--resume: … differs from the run's own copy` | resume 時給了不同的派工單 | 用 `<run_dir>/dispatch.md` |
-| ↳ `judge.adapter 'openai_compat' has no judge.unload_url` | judge 沒辦法卸載；通常會先看到 `last doctor run FAILED (judge.unload …)` | 在 config 加上 `unload_url`，重跑 doctor |
+| ↳ `judge.adapter '<x>' has no judge.unload_url` | openai_compat 沒設 `unload_url`，或 `adapter` 拼錯（doctor 的 `judge.model` 會顯示 `unknown judge adapter`）；通常會先看到 `last doctor run FAILED (judge.unload …)` | openai_compat 就加上 `unload_url`；拼錯就改正拼字，不要加 `unload_url`；然後重跑 doctor |
 | `run` exit 1 加上 Python traceback | config.yaml 結構錯誤、runs_dir 無法建立，或已簽核時開跑前查 judge build，judge 超過 20 秒沒回或回的不是 JSON（traceback 裡有 `RetryableJudgeError`） | 跑 doctor，它會報 FAIL（judge 的問題報在 `judge.model`） |
 | `run` exit 3，`HALTED(infra)` | 夜裡中途壞掉：ComfyUI 連不上（開跑時就連不上也算，run 資料夾會先建好）、ComfyUI queue 一直有別的 job 或卡住的 job 清不掉、workflow 被 ComfyUI 拒收、VRAM 沒釋放、judge 連不上或回 HTTP 錯誤、judge 的 build 在夜裡變了、連續 3 次生成失敗、連續 2 次 L2 錯誤、checker 卡住、workflow 輸出不是剛好一支影片 | 看 report.md 頂端的原因，修好後用第 7 步的方式 resume |
 | `run` exit 3，`HALTED(interrupted)` / `HALTED(crash)` | 按了 Ctrl-C（或 `kill -INT`），或 runner 發生例外 | resume |
@@ -592,7 +593,7 @@ kill -INT <PID>                # 等同 Ctrl-C：HALTED(interrupted)，寫出 re
 | 有 OOM，或一直生成失敗 | 每次失敗都會用掉一次 attempt | 把派工單的 `解析度` 改成 480x832，或把長度改成較短的 4n+1（例如 49 frames） |
 | 報告出現 `encode failed after PASS` | encode 驗證沒過 | 檢查 ffmpeg 有沒有 libx264 和 aac；原始片還在 `<run_dir>/clips/` |
 | `reroll_action` 出現 `steps8 n/a` | workflow 不是 4 步版本，steps 8 不套用（flicker 只換 seed；static 仍會加 motion phrase 並換 seed） | 不需處理 |
-| cron.log 沒有 `[shortsloop] …` 結尾行，也沒有 report.md | 程序被 kill 或機器重開（或 cron 沒觸發，見第 6 步） | 用第 7 步的手動 resume |
+| cron.log 裡沒有當晚的 `[shortsloop] <STATUS>: n/m clips passed · report: …` 結尾行（也沒有 `REFUSING TO RUN`），也沒有 report.md | 程序被 kill 或機器重開（或 cron 沒觸發，見第 6 步）；如果 cron.log 最後是 Python traceback，見上面 exit 1 那列 | kill／重開機：用第 7 步的手動 resume；traceback：什麼都還沒建立，不用 resume，修好、跑 doctor 後重新開跑 |
 | 其他指令：doctor 2、calibrate-batch 2／3／130、calibrate-tune 2／3、label 1、report 2 | — | 見 3、4a、4c／4d、4b、7 的「失敗時」 |
 
 ## 9. 第一晚要親眼確認的 UNVERIFIED-ON-GPU 項目
