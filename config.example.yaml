@@ -1,9 +1,12 @@
 # Machine-local configuration. Copy to config.yaml (gitignored) on the workstation;
-# `shortsloop doctor` verifies every value and writes a skeleton if none exists.
+# `shortsloop doctor` verifies every value. If config.yaml does not exist, doctor
+# writes this file there as a skeleton and FAILS until you fill it in.
 comfy:
   host: "127.0.0.1:8188"            # LAN/Tailscale only — ComfyUI has no auth
   workflow_t2v: "/path/to/your/verified_wan22_t2v_api_export.json"
-  # Prefer your own verified API export over the skill's bundled template.
+  # Prefer your own verified API export over the skill's bundled template. Doctor
+  # dry-runs it (720x1280, 81 frames, 16 fps, steps 8) and checks every model file
+  # its core loader nodes reference on the server; unrecognized loaders FAIL.
 
 judge:
   adapter: "ollama"                 # "ollama" | "openai_compat" (llama.cpp llama-server, vLLM)
@@ -11,13 +14,27 @@ judge:
   model: "qwen3-vl:8b-instruct"     # 8B-class first; escalate to ~32B only if Phase 0 says so
   temperature: 0
   seed: 7
-  num_ctx: 16384                    # 8 images + rubric must fit; doctor probes this
-  timeout_s: 300
+  num_ctx: 16384                    # 8 images + rubric must fit; doctor's L2 dry run sends
+                                    # the real 8-frame 720x1280 rubric call to prove it
+  timeout_s: 300                    # per judge call for a STANDALONE `shortsloop-check`
+                                    # only. The nightly run (and doctor's L2 dry run)
+                                    # use pipeline.yaml policies.judge.timeout_s/retries
   keep_alive_wave: "10m"            # held during a judge wave; unloaded at wave end
+  # unload_url: "http://127.0.0.1:8080/unload"   # REQUIRED for openai_compat: GET drops
+  #                                 # the VLM from VRAM (hard rule 3); without it the
+  #                                 # runner refuses and doctor FAILs judge.unload.
+  #                                 # Doctor reads free VRAM with the VLM loaded and
+  #                                 # again after unload + /free: FAIL unless the
+  #                                 # judge->generation threshold (pipeline.yaml
+  #                                 # vram_handoff.gen_free_min_gb) lies between them.
 
 rewrite:
   enabled: true                     # off_prompt re-roll attempt 2 (one rewrite, logged)
   model: "qwen3:8b"                 # local TEXT model (no vision needed)
+  # base_url: "http://127.0.0.1:11434"   # Ollama serving the rewrite model; default:
+  #                                 # the judge's Ollama, else local Ollama. Doctor checks
+  #                                 # the model on THIS server (warning only).
 
 paths:
-  runs_dir: "runs"                  # put on the big disk; doctor checks headroom
+  runs_dir: "runs"                  # put on the big disk; doctor checks headroom on its
+                                    # filesystem (even before the directory exists)

@@ -3,7 +3,11 @@ pair with a wide margin. Exact decision values are calibrated in Phase 0, not he
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
+import yaml
 
 from shortsloop import l1
 from shortsloop.errors import ClipError, InfraError
@@ -92,3 +96,82 @@ def test_run_checks_rejects_malformed_thresholds(all_metrics):
     with pytest.raises(InfraError):
         l1.run_checks(all_metrics["moving"]["metrics"],
                       {"motion": {"metric": "flow_mag_median", "op": "!!", "value": 0}})
+
+
+def test_spec_check_fails_closed_on_unverifiable_container():
+    """An expectation the container cannot confirm is a spec failure, not a skip."""
+    exp = {"width": 480, "height": 832, "fps": 16.0, "frames": 48, "duration_s": 3.0}
+    base = {"width": 480, "height": 832, "fps": 16.0, "nb_frames": 48,
+            "duration_s": 3.0, "vcodec": "h264"}
+    assert l1.spec_check(base, 48, exp)["pass"] is True
+    assert l1.spec_check({**base, "fps": None}, 48, exp)["pass"] is False
+    assert l1.spec_check({**base, "duration_s": None}, 48, exp)["pass"] is False
+
+
+def test_spec_check_catches_truncation_against_container_header():
+    """moov says 48 frames but only 20 decode (truncated faststart MP4): spec
+    failure even with no dispatch expectation (plan §5 row 4)."""
+    c = {"width": 480, "height": 832, "fps": 16.0, "nb_frames": 48,
+         "duration_s": 3.0, "vcodec": "h264"}
+    res = l1.spec_check(c, 20, None)
+    assert res["pass"] is False and "decoded" in res["reason"]
+    assert l1.spec_check(c, 47, None)["pass"] is True        # encoder off-by-one ok
+
+
+# --- dense flicker (audit: alternate-frame strobing / bursts scored 0 dips) ----------
+
+def test_dense_flicker_is_counted(all_metrics):
+    """Alternate-frame strobing (every pair low) and a ~1 s strobe burst must register
+    as flicker — a rolling median that sinks with the dips used to hide them."""
+    moving = all_metrics["moving"]["metrics"]["flicker_dips"]
+    for kind in ("strobe", "strobe_burst"):
+        dips = all_metrics[kind]["metrics"]["flicker_dips"]
+        assert dips >= 6, f"{kind}: dense flicker invisible to L1 (flicker_dips={dips})"
+        assert dips >= moving + 5, f"{kind}={dips} vs moving={moving}"
+
+
+def test_flicker_dips_near_zero_on_flicker_free_kinds(all_metrics):
+    for kind in ("static", "moving", "blurry", "black", "freeze_tail"):
+        dips = all_metrics[kind]["metrics"]["flicker_dips"]
+        assert dips == 0, f"{kind} should be flicker-free, got flicker_dips={dips}"
+
+
+def test_repo_placeholder_thresholds_fail_strobes_on_flicker(all_metrics):
+    """With the shipped thresholds.yaml (flicker <= 2) both strobe kinds FAIL the
+    flicker check, while the clean moving clip passes it."""
+    repo_l1 = yaml.safe_load(
+        (Path(__file__).parents[1] / "thresholds.yaml").read_text(encoding="utf-8"))["l1"]
+    flicker_only = {"flicker": repo_l1["flicker"]}
+    for kind in ("strobe", "strobe_burst", "flicker"):
+        (chk,) = l1.run_checks(all_metrics[kind]["metrics"], flicker_only)
+        assert chk["pass"] is False, f"{kind} passed the flicker check: {chk}"
+    (ok,) = l1.run_checks(all_metrics["moving"]["metrics"], flicker_only)
+    assert ok["pass"] is True
+
+
+def _flat_ssims(n_frames, value=0.70):
+    return np.full(n_frames - 1, value)
+
+
+@pytest.mark.parametrize("period", [2, 3])
+def test_periodic_luma_flicker_counted(period):
+    """Period-2/3 brightness flicker with a flat SSIM trace (the hard case for a
+    rolling-median dip detector) is counted via luma reversals."""
+    n = 48
+    lumas = [0.5 + (0.25 if i % period == period - 1 else 0.0) for i in range(n)]
+    assert l1.flicker_dips(_flat_ssims(n), lumas) >= 10
+
+
+@pytest.mark.parametrize("lumas", [
+    [0.05 + 0.025 * i for i in range(36)],              # fade: big but monotonic
+    [0.3] * 24 + [0.7] * 24,                             # one hard cut: no reversal
+    [0.5 + (0.01 if i % 2 else 0.0) for i in range(48)],  # sub-threshold shimmer
+])
+def test_luma_term_ignores_fades_cuts_and_shimmer(lumas):
+    assert l1.flicker_dips(_flat_ssims(len(lumas)), lumas) == 0
+
+
+def test_isolated_ssim_dip_still_counted():
+    ssims = np.full(47, 0.70)
+    ssims[20] = 0.60
+    assert l1.flicker_dips(ssims, [0.5] * 48) == 1

@@ -17,6 +17,7 @@ from conftest import write_thresholds
 from fake_comfy import serve_comfy
 from fake_judge import GOOD_SCORES, serve as serve_judge
 
+from shortsloop.doctor import fingerprint
 from shortsloop.policy import MOTION_PHRASES
 from shortsloop.runner import Runner, ship_gate
 
@@ -86,9 +87,9 @@ def make_env(tmp_path, comfy, judge_url, *, thresholds_over=None, policies_over=
         "rewrite": {"enabled": True, "model": "fake-text-model"},
         "paths": {"runs_dir": str(tmp_path / "runs")},
     }), encoding="utf-8")
-    # a passing doctor snapshot next to the config (the runner's doctor-gate)
-    (tmp_path / "doctor.json").write_text(json.dumps({"ok": True, "checks": []}),
-                                          encoding="utf-8")
+    # a passing doctor snapshot for THIS setup next to the config (the doctor-gate)
+    (tmp_path / "doctor.json").write_text(json.dumps(
+        {"ok": True, "checks": [], "fingerprint": fingerprint(config, pipeline)}), encoding="utf-8")
     return {"config": config, "pipeline": pipeline, "thresholds": thr,
             "runs": tmp_path / "runs"}
 
@@ -236,7 +237,9 @@ def test_doctor_gate_refuses_without_passing_snapshot(clips, tmp_path):
 
         # supervised override works; then a passing snapshot works
         assert make_runner(small_sheet(tmp_path), env, skip_doctor=True).run() == 0
-        doctor_json.write_text(json.dumps({"ok": True, "checks": []}))
+        doctor_json.write_text(json.dumps({"ok": True, "checks": [],
+                                           "fingerprint": fingerprint(env["config"],
+                                                                       env["pipeline"])}))
         assert make_runner(small_sheet(tmp_path), env).run() == 0
 
 
@@ -303,9 +306,12 @@ def test_ship_gate_rejects_everything_but_full_pass():
     assert not ship_gate({**ok, "layers_run": ["l1"]})[0]
     assert not ship_gate({**ok, "error": {"scope": "clip"}})[0]
     assert not ship_gate({**ok, "thresholds": {"calibrated": False}})[0]
-    assert ship_gate({**ok, "thresholds": {"calibrated": False}},
-                     allow_uncalibrated=True)[0]
+    assert not ship_gate({**ok, "thresholds": {"calibrated": "true"}})[0]   # strict bool
     assert not ship_gate(None)[0]
+    # plan §2.1: no override parameter exists — supervised uncalibrated runs encode
+    # to encoded_uncalibrated/ instead (test_runner_hardening)
+    import inspect
+    assert list(inspect.signature(ship_gate).parameters) == ["verdict"]
 
 
 def test_oom_recovery_frees_and_rerolls(clips, tmp_path):
@@ -397,3 +403,32 @@ def test_resume_reattaches_in_flight_job(clips, tmp_path):
         rep = run_report(runner)
         assert rep["clips"][0]["status"] == "passed"
         assert judge.chat_calls == 1
+
+
+def test_missing_shared_params_fall_back_loudly_and_are_still_spec_checked(clips, tmp_path):
+    """Plan §2.5: absent shared params fall back to defaults AND the fallback is
+    logged; the spec check verifies the clip against what was actually requested
+    (720x1280 default here vs the 480x832 fixture → spec FAIL, never a pass)."""
+    sheet = small_sheet(tmp_path)
+    text = sheet.read_text(encoding="utf-8")
+    start, end = text.index("## 0. 共用參數"), text.index("## 生產清單")
+    sheet.write_text(text[:start] + text[end:], encoding="utf-8")
+    with serve_comfy(fixture_paths=clips) as comfy, serve_judge() as (judge, jurl):
+        env = make_env(tmp_path, comfy, jurl)
+        runner = make_runner(sheet, env)
+        assert runner.run() == 0
+        rep = run_report(runner)
+        clip = rep["clips"][0]
+        assert clip["status"] == "failed_final"
+        assert clip["failure_classes"] == ["broken"]          # spec → broken
+        reasons = " ".join(r for a in clip["attempts"] for r in a["fail_reasons"])
+        assert "width 480 != expected 720" in reasons
+        assert judge.chat_calls == 0
+        events = [json.loads(l) for l in
+                  (runner.run_dir / "events.jsonl").read_text().splitlines()]
+        fb = [e for e in events if e["stage"] == "schedule" and e["data"].get("fallback")]
+        assert fb and set(fb[0]["data"]["fallback"]) == {"width", "height", "length", "fps"}
+        assert "fallback" in (runner.run_dir / "report.md").read_text(encoding="utf-8")
+        att = json.loads((runner.run_dir / "attempts.jsonl").read_text().splitlines()[0])
+        assert att["patch_args"]["fps"] == 16.0                # fps is a patch arg
+        assert comfy.violations == 0

@@ -29,7 +29,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/tags":
             self._json({"models": [{"name": self.server.model,
-                                    "digest": "sha256:fakedigest"}]})
+                                    "digest": self.server.digest}]})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -41,6 +41,7 @@ class _Handler(BaseHTTPRequestHandler):
             is_vision = any("images" in m for m in messages)
             if not is_vision:                      # text-only = rewrite request
                 self.server.rewrite_calls += 1
+                self.server.rewrite_times.append(time.monotonic())
                 self.server.last_rewrite_payload = payload
                 self._json({"message": {"role": "assistant",
                                         "content": json.dumps(
@@ -57,6 +58,8 @@ class _Handler(BaseHTTPRequestHandler):
                         "done": True})
         elif self.path == "/api/generate":  # unload request
             self.server.generate_calls += 1
+            self.server.generate_times.append(time.monotonic())
+            self.server.unloaded_models.append(payload.get("model"))
             self._json({"done": True})
         else:
             self._json({"error": "not found"}, 404)
@@ -78,6 +81,10 @@ class FakeOllama(ThreadingHTTPServer):
         self.chat_calls = 0
         self.chat_times: list[float] = []
         self.generate_calls = 0
+        self.digest = "sha256:fakedigest"
+        self.generate_times: list[float] = []
+        self.unloaded_models: list[str] = []
+        self.rewrite_times: list[float] = []
         self.rewrite_calls = 0
         self.last_chat_payload = None
         self.last_rewrite_payload = None

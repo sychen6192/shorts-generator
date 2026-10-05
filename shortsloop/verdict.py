@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
-from .policy import failure_classes
+from .policy import CLASS_PRIORITY, failure_classes
 
 EXIT_BY_VERDICT = {"PASS": 0, "PROCEED": 0, "FAIL": 1, "ERROR": 2}
 
@@ -137,10 +137,43 @@ def validate(v: dict) -> list[str]:
         errs.append("FAIL requires at least one failure class")
     if verdict in ("PASS", "PROCEED") and v.get("failure_classes"):
         errs.append(f"{verdict} must have empty failure_classes")
+    if verdict == "ERROR" and v.get("failure_classes"):
+        errs.append("ERROR must have empty failure_classes")
+    classes = v.get("failure_classes") or []
+    if isinstance(classes, list) and all(c in CLASS_PRIORITY for c in classes):
+        if classes != sorted(set(classes), key=CLASS_PRIORITY.index):
+            errs.append(f"failure_classes {classes} not unique in priority order")
+    layers = v.get("layers_run") or []
+    if layers not in ([], ["l1"], ["l1", "l2"]):
+        errs.append(f"layers_run {layers} is not [], [l1] or [l1, l2]")
+    if (v.get("l1") is not None) != ("l1" in layers):
+        errs.append("l1 block present iff 'l1' in layers_run")
+    if (v.get("l2") is not None) != ("l2" in layers):
+        errs.append("l2 block present iff 'l2' in layers_run")
+    l1 = v.get("l1")
+    if isinstance(l1, dict) and isinstance(l1.get("checks"), list):
+        if l1.get("pass") != all(isinstance(c, dict) and c.get("pass") is True
+                                 for c in l1["checks"]):
+            errs.append("l1.pass != AND of l1.checks[].pass")
     if v.get("l2") is not None:
         dims = v["l2"].get("dimensions", {})
         expected = {"prompt_adherence", "subject_consistency", "anatomy_artifacts",
                     "temporal_coherence", "imaging_quality"}
         if set(dims) != expected:
             errs.append(f"l2.dimensions keys {sorted(dims)} != expected {sorted(expected)}")
+        else:
+            for name, d in dims.items():
+                if not isinstance(d, dict):
+                    continue
+                if d.get("na") and name != "subject_consistency":
+                    errs.append(f"l2.{name}: na is only allowed for subject_consistency")
+                want = bool(d.get("na")) or (isinstance(d.get("score"), int)
+                                             and isinstance(d.get("floor"), int)
+                                             and d["score"] >= d["floor"])
+                if d.get("pass") is not want:
+                    errs.append(f"l2.{name}.pass inconsistent with score/floor/na")
+            scored = [d for d in dims.values() if isinstance(d, dict) and not d.get("na")]
+            want_pass = bool(scored) and all(d.get("pass") is True for d in scored)
+            if v["l2"].get("pass") is not want_pass:
+                errs.append("l2.pass != AND of non-N/A dimensions")
     return errs

@@ -1,6 +1,9 @@
 # shortsloop v1 — implementation plan
 
-Status: **approved 2026-08-12 · M1–M5 implemented and CPU-verified (79 tests).**
+Status: **approved 2026-08-12 · M1–M5 implemented and CPU-verified · audit-hardened
+2026-10-04 (9-lens audit vs this plan + CLAUDE.md; every fix test-first; amendments
+below are marked *amended 2026-10-04* and only make existing contracts explicit or
+fail-closed — no verdict field, exit code, class or stage name changed).**
 The verdict schema, exit codes, failure classes, stage names, and file layouts in
 this document are **frozen** — implementation may not drift from them without
 coming back here first. Next: the workstation phase (`docs/runbook.md`) — doctor,
@@ -58,15 +61,42 @@ dispatch.md ──intake──► work items ──┐
 ```
 shortsloop-check CLIP.mp4 --prompt-file PROMPT.txt --json VERDICT.json
                  [--l1-only] [--thresholds FILE] [--config FILE]
+                 [--expect '{"width":720,"height":1280,"fps":16,"frames":81,"duration_s":5.062}']
 ```
 
-- Exit **0 = PASS**, **1 = FAIL**, **2 = ERROR** (could not evaluate).
+- Exit **0 = PASS**, **1 = FAIL**, **2 = ERROR** (could not evaluate). *Amended
+  2026-10-04:* any internal checker failure — including one outside evaluation, e.g.
+  the verdict file cannot be written — exits 2 with a `VERDICT ERROR` line; the
+  verdict file is written atomically, as strict JSON, and only after it validates
+  against the schema (else it is downgraded to an infra ERROR).
+- `--expect` (*amended 2026-10-04, documenting existing use*): the spec check's
+  expectations. The runner always passes the EFFECTIVE generation parameters (sheet
+  values or logged fallback defaults). Tolerances: resolution exact, fps ±1, frames
+  ±2, duration ±15%. An expectation the container cannot confirm (fps/duration
+  unknown) fails; decoded frames vs the container's declared `nb_frames` beyond ±2
+  fails even without `--expect` (truncated stream).
 - Full mode runs L1 then L2 (L2 skipped if L1 fails → verdict FAIL, `l2: null`).
 - `--l1-only` verdict vocabulary is `PROCEED / FAIL / ERROR` (exit 0/1/2). It can
   **never** emit `PASS`; a PROCEED verdict is not shippable by construction.
 - Ship-gate (in the runner, tested): a clip may be encoded/shipped only from a verdict
   file with `verdict == "PASS"` AND `layers_run == ["l1","l2"]` AND
-  `thresholds.calibrated == true`.
+  `thresholds.calibrated == true`. *Amended 2026-10-04:* no override exists; a
+  supervised `--allow-uncalibrated` run encodes its PASS clips to
+  `encoded_uncalibrated/` (never `encoded/`), and persist re-checks that the clip's
+  bytes still hash to the verdict's `clip.sha256`. The nightly judge must be the one
+  the thresholds were calibrated with (`provenance.judge`): another model refuses
+  at start; another build of the same model is refused at start (one /api/tags or
+  /v1/models call, no VRAM) and, re-read every judge wave plus compared against each
+  verdict's `l2.model_digest`, halts the run if the build changes mid-night — nothing
+  judged by an uncalibrated build ships. Thresholds approved with
+  `--accept-untested-l2` (L2 floors never tested against labels) count as
+  uncalibrated for the unattended gate and the ship gate: supervised
+  `--allow-uncalibrated` runs only, PASS clips to `encoded_uncalibrated/`.
+- Judge replies (*amended 2026-10-04*): the reply must BE the five-dimension JSON
+  object, optionally after one complete `<think>…</think>` block and inside one
+  ``` fence; unterminated reasoning, prose around the object, or a truncated reply
+  (`done_reason`/`finish_reason` = length) is retried, then clip ERROR — never parsed
+  out of surrounding text.
 - Standalone hand use works with nothing but the clip + prompt file (+ reachable judge
   for full mode).
 
@@ -96,8 +126,12 @@ Top-level fields (all always present unless noted):
 - `metrics` (all numeric, all always present):
   `flow_mag_median`, `flow_mag_p90` (mean Farneback magnitude per frame-pair,
   normalized by analysis-frame diagonal; aggregated over pairs),
-  `ssim_min`, `ssim_p05`, `ssim_mean`, `flicker_dips` (count of pairs whose SSIM drops
-  ≥ `flicker_delta` below the rolling median of neighbors),
+  `ssim_min`, `ssim_p05`, `ssim_mean`, `flicker_dips` (*amended 2026-10-04: dense
+  flicker* — the v1 count of pairs whose SSIM drops ≥ 0.03 below the rolling median of
+  a 7-pair window centred on the pair, PLUS the number of frames whose mean-luma change
+  reverses sign versus the previous change with |Δluma| ≥ 0.02 on both sides, so
+  alternate-frame strobing and strobe bursts count, not only isolated pops; flicker
+  that leaves mean luma unchanged, e.g. texture boiling, remains a known L1 blind spot),
   `freeze_longest_run_s` (longest run of consecutive pairs with SSIM ≥ 0.995 and flow
   ≈ 0), `laplacian_p10`, `laplacian_median` (per-frame Laplacian variance),
   `luma_mean`, `black_frame_frac` (frames with mean luma < 16/255),
@@ -163,7 +197,12 @@ provenance:
   tuned_at: null
   tune_test_split: null      # e.g. "28/12 stratified"
   test_agreement: null       # fraction
-  test_false_pass: null      # fraction + CI string
+  test_false_pass: null      # "k/n labeled-fail test clips would ship (…%, 95% CI …)"
+  # amended 2026-10-04 (tuner provenance, additive): test_false_fail, test_scope
+  # (L1-only | L1+L2), judge {model, model_digest}, l1_impl, inputs_sha256
+  # {batch_manifest, l2_scores}, values_sha256, approved_at, l2_floors_fallback,
+  # l2_untested_accepted. The runner enforces judge (model refuse / build halt) and
+  # l1_impl (refuse) at run time and prints the caveats in the morning report.
 l1:
   motion:     {metric: flow_mag_median,      op: ">=", value: PLACEHOLDER}
   freeze:     {metric: freeze_longest_run_s, op: "<=", value: PLACEHOLDER}
@@ -180,6 +219,12 @@ l2:
     temporal_coherence: 3
     imaging_quality: 3
 ```
+
+*Amended 2026-10-04 — validated everywhere it is read* (checker, runner, doctor,
+`calibrate-tune --approve`; `shortsloop/thresholds.py`): exactly the seven `l1` checks
+with exactly these metric/op pairs and finite numeric values; exactly the five floors,
+integers 1–5; `calibrated` a YAML boolean (`"false"` is an error, not truthy). Anything
+else is an infra error / refusal — never a silently weaker instrument.
 
 ### 2.5 Dispatch sheet intake contract
 
@@ -214,30 +259,50 @@ action AND camera move):
 ### 2.7 State on disk
 
 ```
-runs/<run_id>/                      # run_id = YYYYMMDD-HHMMSS-<slug>
-  run.json                          # config snapshot, dispatch path+sha, doctor snapshot ref
+runs/<run_id>/                      # run_id = YYYYMMDD-HHMMSS-<slug>[-N] (never reused)
+  run.json                          # config snapshot ref, dispatch path+sha, doctor snapshot ref;
+                                    # kept on --resume, which appends to `resumes`
+  config.snapshot.yaml              # config.yaml + pipeline.yaml judge policy, as the checker saw it
   events.jsonl                      # append-only state transitions (schema below)
-  attempts.jsonl                    # append-only, one line per generation attempt
+  attempts.jsonl                    # append-only, one line per generation attempt outcome
   dispatch.md                       # verbatim copy of the input sheet
+  prompts/<clip_id>_a<n>.txt        # the exact prompt each attempt submitted (checker input)
   clips/<clip_id>_a<n>.mp4          # raw ComfyUI outputs
-  verdicts/<clip_id>_a<n>.json      # checker verdicts (+ .l2_raw.json beside)
+  verdicts/<clip_id>_a<n>[.l1].json # checker verdicts (L1 gate / full; + .l2_raw.json beside)
   sheets/<clip_id>_a<n>.jpg         # 6-frame contact sheet per attempt
-  encoded/<clip_id>.mp4             # silent 1080x1920 QC encodes (PASS clips only)
+  encoded/<clip_id>.mp4             # silent 1080x1920 QC encodes (PASS clips only, verified)
+  encoded_uncalibrated/<clip_id>.mp4  # supervised --allow-uncalibrated runs only; NOT shippable
   report.md / report.json
+runs/.shortsloop.lock               # one runner per runs dir (hard rule 4)
 ```
 
 `events.jsonl` line: `{ts, run_id, clip_id, attempt, stage, event, data}` where
 `stage ∈ {schedule, claim, generate, verify, persist, complete}` (exactly the manifest
-vocabulary) and `event ∈ {enter, ok, fail, error, skip}`.
+vocabulary) and `event ∈ {enter, ok, fail, error, skip}` — *amended 2026-10-04,
+documenting existing use:* plus `submitted` (generate: ComfyUI accepted the job; its
+prompt_id is what resume re-attaches to) and `halt` (complete: infra stop). A
+`complete ok {wave_done: N}` event marks each finished wave (resume continues from
+the last finished wave, so a wave cut short is redone, never skipped), and `claim ok`
+carries the attempt's re-roll base (`prompt_base`, `rewritten`, `rewrite_diff`) so a
+rewrite in flight at a crash survives --resume.
 
 `attempts.jsonl` line: `{ts, clip_id, attempt, seed, prompt_text, prompt_sha256,
 prompt_rewritten: bool, prompt_diff, workflow_path, workflow_sha256, patch_args,
 comfy_prompt_id, output_path, output_sha256, gen_elapsed_s, verdict_path, verdict,
-failure_classes, l1_pass, l2_pass, vram_free_before_gb, notes}`.
+failure_classes, l1_pass, l2_pass, vram_free_before_gb, notes}` — plus (additive)
+`prompt_base`, `status`, `reroll_action`, `contact_sheet`, `fail_reasons`, `steps`,
+`wave`. *Amended 2026-10-04:* an attempt that passed the L1 gate when a run halted
+gets a line with `status: unjudged` (verdict `PROCEED`); a resumed run that judges it
+appends the final line — readers take the LAST line per `(clip_id, attempt)`. A hard
+crash that beat even that line is recovered from events.jsonl (submitted ->
+re-attach, downloaded -> L1 gate, L1 PROCEED -> judge), so --resume never
+regenerates an existing clip.
 
 Reproducibility check: `comfy_client.py run -w <workflow> --prompt "<prompt_text>"
---seed <seed> --width … --height … --length … [--steps …]` from one attempts.jsonl
-line regenerates the clip.
+--seed <seed> --width … --height … --length … --fps … [--steps …]` (all from
+`patch_args`) regenerates the clip. The runner dry-runs the workflow at load and
+refuses one whose seed/size/length/steps inputs are linked (not patchable) — such a
+workflow would silently ignore re-roll seeds.
 
 ### 2.8 `pipeline.yaml` (declarative manifest for future engine migration)
 
@@ -251,7 +316,7 @@ policies:
   waves_max: 3                      # = max_attempts
   comfy: {timeout_s: 1800, poll_s: 5, one_job_at_a_time: true}
   judge: {timeout_s: 300, retries: 1, infra_escalation_after: 2}
-  vram_handoff: {free_min_gb: 24, wait_timeout_s: 180}
+  vram_handoff: {free_min_gb: 24, wait_timeout_s: 180}   # + optional gen_free_min_gb
 resources:
   comfy_host: ${COMFY_HOST}
   workflow_t2v: config              # resolved from config.yaml
@@ -259,6 +324,12 @@ resources:
 ```
 
 v1's runner interprets this file; a workflow engine later binds the same stage names.
+Policy values are type-checked (counts integers ≥ 1, times/sizes positive numbers,
+retries an integer ≥ 0): a mistyped value refuses the run instead of crashing it.
+*Amended 2026-10-04:* `judge.timeout_s` / `judge.retries` are authoritative for the
+nightly checker (written into `config.snapshot.yaml`); the judge-error escalation
+counter spans waves; 3 consecutive generation failures across the run are an infra
+halt (a broken workflow/server is not three unlucky clips per clip).
 Machine-local values (hosts, model names, paths) live in `config.yaml` (gitignored;
 skeleton written by `doctor`).
 
@@ -310,17 +381,36 @@ shorts-generator/
 
 ## 4. VRAM handoff enforcement (hard rule 3, in code)
 
-Wave boundary, generation → judge:
-1. `POST /free {"unload_models": true, "free_memory": true}` to ComfyUI.
-2. Poll `/system_stats` until `vram_free ≥ vram_handoff.free_min_gb` or
-   `wait_timeout_s` → on timeout: **infra ERROR, halt** (models didn't unload; judging
-   would OOM or swap-thrash).
-3. Judge wave runs; last judge call (or explicit unload request) sets
-   `keep_alive: 0` so the VLM unloads.
-4. Next generation wave begins (ComfyUI reloads Wan lazily on first job).
+One implementation, `shortsloop/gpu.py`, used by the runner, calibrate-batch,
+calibrate-tune --with-l2 and doctor. Free VRAM is measured as seen by ANY process
+(`vram_free − torch_vram_free`).
 
-Tests: fake ComfyUI asserts `/free` called before any judge call; fake stats report
-low VRAM → runner halts with infra ERROR and no clip ships.
+Generation → judge (`gpu.to_judge`):
+1. `POST /free {"unload_models": true, "free_memory": true}` to ComfyUI.
+2. Poll `/system_stats` until free ≥ `vram_handoff.free_min_gb` or `wait_timeout_s`
+   → on timeout: **infra ERROR, halt** (Wan didn't unload; judging would OOM).
+3. Judge wave runs; at its end — on every exit path — the judge VLM AND the rewrite
+   LLM are unloaded (`keep_alive: 0`; openai_compat via `judge.unload_url`).
+
+Judge → generation (`gpu.to_generation`, *amended 2026-10-04 — the old step 4 only
+assumed this*), before the first submission of EVERY generation wave including
+wave 1: wait for an empty ComfyUI queue (its /free is deferred behind a running
+job), unload judge + rewrite models, `/free`, poll until free ≥
+`vram_handoff.gen_free_min_gb` (optional; default `free_min_gb`) → on timeout
+**infra halt** before Wan loads beside a resident model. A resident 8B VLM can leave
+more than the judge's own floor free on a 32 GB card, so doctor measures free VRAM
+with the VLM loaded and after unloading, FAILs when the generation threshold cannot
+tell them apart, and recommends a value between them. An openai_compat judge needs
+`judge.unload_url` (refused otherwise).
+
+Hard rule 4 from the outside (`comfy.py`): the queue must be empty before every
+submit; after any failed wait our job is interrupted (only if running) or deleted
+(if pending) and verified gone; resume finishes interrupted jobs before anything new
+and detects jobs a restarted ComfyUI forgot.
+
+Tests: fake ComfyUI (sequential queue, hung jobs, /interrupt, queue delete, scripted
+/free outcomes) asserts /free before any judge call, ≤1 in-flight job in every
+runner test, and halts on VRAM that stays occupied in either direction.
 
 ## 5. Test plan (fail-closed matrix is the core deliverable)
 
@@ -348,6 +438,11 @@ Every hard rule gets at least one test that proves the bad path cannot ship a cl
 
 Fixtures are synthesized with OpenCV/numpy (moving box, alternating luma, noise
 fields) — no GPU, no network; the entire matrix runs in this cloud session.
+*2026-10-04:* every row now has a runner-level test where the row names runner
+behavior (`tests/test_runner_hardening.py`, `tests/test_resume.py`); row 16 also
+verifies aac + digital silence (volumedetect); row 17 has golden verdicts of every
+kind plus 26 off-contract mutations (`tests/test_schema.py`), and the schema is
+enforced at emit time.
 
 ## 6. Phase 0 calibration (workstation; two user gates)
 

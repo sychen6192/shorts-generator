@@ -3,10 +3,23 @@
 Scenario queue (one entry consumed per /prompt submission):
     {"fixture": "moving"}   -> job completes; /view serves that fixture's bytes
     {"error": "oom"}        -> history reports an execution_error (CUDA OOM text)
-    {"hang": True}          -> history never appears (client times out)
+    {"hang": True}          -> job runs forever (client times out) until /interrupt
+    {"history_500": True}   -> /history answers HTTP 500 (the vendored client
+                               crashes mid-wait) while the job keeps running
+    {"fixture": "moving", "extra_png": True}  -> also emits a PNG output first
+
+Execution is sequential like the real server: the oldest unfinished job is
+"running", the rest "pending" (GET /queue). /interrupt stops the running job;
+POST /queue {"delete": [...]} drops pending ones.
 
 Asserts hard rule 4 from the OUTSIDE: `violations` counts submissions that arrived
-while another job was still unfinished.
+while another job was still unfinished (hung jobs included).
+
+VRAM model: loading Wan (/prompt) drops vram_free to `vram_loaded_gb`; each /free
+sets it to the next value of `free_results` (default: vram_after_free_gb), or
+leaves it untouched when `never_frees`. Like real ComfyUI (server.py /free only
+sets queue flags; the prompt worker applies them after the running job), a /free
+received while a job is unfinished is DEFERRED until no job is running.
 """
 
 from __future__ import annotations
@@ -64,14 +77,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"system": {"comfyui_version": "fake"},
                         "devices": [{"name": "FakeGPU 5090",
                                      "vram_free": int(srv.vram_free_gb * GB),
-                                     "vram_total": 32 * GB}]})
+                                     "vram_total": 32 * GB,
+                                     "torch_vram_free": int(srv.torch_cache_gb * GB),
+                                     "torch_vram_total": 0}]})
         elif parsed.path.startswith("/models/"):
             folder = parsed.path.rsplit("/", 1)[1]
             self._json(srv.models.get(folder, []))
         elif parsed.path.startswith("/history/"):
             pid = parsed.path.rsplit("/", 1)[1]
             job = srv.jobs.get(pid)
-            if job is None or job["scenario"].get("hang"):
+            if job is not None and job.get("interrupted"):
+                self._json({pid: {"status": {
+                    "status_str": "error", "completed": False,
+                    "messages": [["execution_interrupted", {"node_id": "4"}]]}}})
+                return
+            if job is not None and job["scenario"].get("history_500"):
+                self._json({"error": "boom"}, 500)     # client crashes; job keeps running
+                return
+            if job is None or job.get("deleted") or job["scenario"].get("hang"):
                 self._json({})
                 return
             job["polls"] += 1
@@ -79,6 +102,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({})
                 return
             job["done"] = True
+            job.setdefault("done_at", time.monotonic())
+            srv.apply_deferred_free()
             if job["scenario"].get("error"):
                 self._json({pid: {"status": {
                     "status_str": "error", "completed": False,
@@ -88,9 +113,14 @@ class _Handler(BaseHTTPRequestHandler):
                         "exception_message": "CUDA out of memory (fake)"}]]}}})
                 return
             fname = f"{pid}.mp4"
+            outputs = {"61": {"images": [
+                {"filename": fname, "subfolder": "", "type": "output"}]}}
+            if job["scenario"].get("extra_png"):
+                outputs = {"60": {"images": [{"filename": f"{pid}_last.png",
+                                              "subfolder": "", "type": "output"}]},
+                           **outputs}
             self._json({pid: {
-                "outputs": {"61": {"images": [
-                    {"filename": fname, "subfolder": "", "type": "output"}]}},
+                "outputs": outputs,
                 "status": {"status_str": "success", "completed": True,
                            "messages": []}}})
         elif parsed.path == "/view":
@@ -99,7 +129,9 @@ class _Handler(BaseHTTPRequestHandler):
             pid = fname.rsplit(".", 1)[0]
             job = srv.jobs.get(pid)
             data = b""
-            if job is not None:
+            if fname.endswith("_last.png"):
+                data = b"\x89PNG\r\n\x1a\n fake last frame"
+            elif job is not None:
                 fixture = job["scenario"].get("fixture", "moving")
                 data = Path(srv.fixture_paths[fixture]).read_bytes()
             self.send_response(200)
@@ -108,9 +140,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif parsed.path == "/queue":
-            running = [[0, pid] for pid, j in srv.jobs.items()
-                       if not j["done"] and not j["scenario"].get("error")]
-            self._json({"queue_running": running, "queue_pending": []})
+            live = srv.unfinished()
+            self._json({"queue_running": [[0, pid] for pid in live[:1]],
+                        "queue_pending": [[i, pid] for i, pid in
+                                          enumerate(live[1:], start=1)]})
         else:
             self._json({}, 404)
 
@@ -119,25 +152,40 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/prompt":
-            unfinished = [j for j in srv.jobs.values()
-                          if not j["done"] and not j["scenario"].get("hang")]
-            if unfinished:
+            if srv.unfinished():
                 srv.violations += 1
+            srv.vram_free_gb = srv.vram_loaded_gb      # Wan loads for this job
             scenario = srv.scenarios.pop(0) if srv.scenarios else {"fixture": "moving"}
             pid = uuid.uuid4().hex
             srv.jobs[pid] = {"scenario": scenario, "polls": 0, "done": False,
                              "info": _extract(payload.get("prompt", {})),
                              "order": len(srv.submissions)}
             srv.submissions.append(pid)
+            srv.submit_times.append(time.monotonic())
             self._json({"prompt_id": pid, "number": len(srv.submissions)})
         elif self.path == "/free":
             srv.free_calls += 1
             srv.free_times.append(time.monotonic())
-            if not srv.never_frees:
-                srv.vram_free_gb = srv.vram_after_free_gb
+            srv.free_pending = True
+            srv.apply_deferred_free()
             self._json({})
         elif self.path == "/interrupt":
             srv.interrupt_calls += 1
+            live = srv.unfinished()
+            if live:                                    # stops the RUNNING job only
+                srv.jobs[live[0]]["interrupted"] = True
+                srv.jobs[live[0]]["done"] = True
+                srv.jobs[live[0]]["done_at"] = time.monotonic()
+                srv.apply_deferred_free()
+            self._json({})
+        elif self.path == "/queue":
+            for pid in payload.get("delete") or []:
+                job = srv.jobs.get(pid)
+                if job is not None and not job["done"]:
+                    job["deleted"] = True
+                    job["done"] = True
+                    srv.deleted.append(pid)
+            srv.apply_deferred_free()
             self._json({})
         else:
             self._json({}, 404)
@@ -147,7 +195,9 @@ class FakeComfy(ThreadingHTTPServer):
     def __init__(self, fixture_paths: dict, scenarios: list[dict] | None = None,
                  vram_free_gb: float = 4.0, vram_after_free_gb: float = 28.0,
                  never_frees: bool = False, preloaded_jobs: dict | None = None,
-                 models: dict | None = None):
+                 models: dict | None = None, vram_loaded_gb: float = 4.0,
+                 free_results: list[float] | None = None,
+                 torch_cache_gb: float = 0.0):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.fixture_paths = {k: str(v) for k, v in fixture_paths.items()}
         self.models = models or {}
@@ -155,6 +205,12 @@ class FakeComfy(ThreadingHTTPServer):
         self.vram_free_gb = vram_free_gb
         self.vram_after_free_gb = vram_after_free_gb
         self.never_frees = never_frees
+        self.vram_loaded_gb = vram_loaded_gb
+        self.free_results = list(free_results or [])
+        self.torch_cache_gb = torch_cache_gb
+        self.deleted: list[str] = []
+        self.submit_times: list[float] = []
+        self.free_pending = False
         self.jobs: dict[str, dict] = dict(preloaded_jobs or {})
         self.submissions: list[str] = []
         self.violations = 0
@@ -164,6 +220,21 @@ class FakeComfy(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         pass
+
+    def apply_deferred_free(self) -> None:
+        """Apply a pending /free once nothing is running (real ComfyUI semantics)."""
+        if not self.free_pending or self.unfinished():
+            return
+        self.free_pending = False
+        if not self.never_frees:
+            self.vram_free_gb = (self.free_results.pop(0) if self.free_results
+                                 else self.vram_after_free_gb)
+
+    def unfinished(self) -> list[str]:
+        """prompt_ids not yet finished, in execution order (hung jobs included)."""
+        live = [(j.get("order", 0), pid) for pid, j in self.jobs.items()
+                if not j["done"] and not j["scenario"].get("error")]
+        return [pid for _, pid in sorted(live)]
 
     @property
     def host(self) -> str:

@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from conftest import write_thresholds
 
 from shortsloop.schema import validate_verdict_file
@@ -121,3 +123,96 @@ def test_expect_mismatch_fails_spec(clips, thresholds_permissive, prompt_file, t
     assert v["failure_classes"] == ["broken"]
     spec = [c for c in v["l1"]["checks"] if c["name"] == "spec"][0]
     assert not spec["pass"]
+
+
+def test_stale_verdict_file_is_never_reused(clips, tmp_path):
+    """Runner-side: a verdict file left from an earlier invocation must not be read
+    as the verdict of a checker that crashed before writing (hard rule 2)."""
+    import sys as _sys
+    from shortsloop.runner import Runner, RunHalted
+    out = tmp_path / "v.json"
+    out.write_text(json.dumps({"verdict": "PROCEED", "layers_run": ["l1"]}))
+    r = Runner(dispatch_path="x", config_path="x", pipeline_path="x",
+               thresholds_path=tmp_path / "t.yaml",
+               checker_argv=[_sys.executable, "-c", "import sys; sys.exit(1)"])
+    r.expect = {}
+    r.config_path = tmp_path / "c.yaml"
+    with pytest.raises(RunHalted):
+        r._invoke_checker(clips["moving"], tmp_path / "p.txt", out, l1_only=True)
+
+
+# ------------------------------------------------------------------ emit hardening
+
+def test_checker_crash_outside_evaluation_is_error_exit_2(clips, thresholds_permissive,
+                                                          prompt_file, tmp_path):
+    """Exit 1 means FAIL; a checker that could not even write its verdict must say
+    ERROR (exit 2), never FAIL or PASS."""
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    code, summary, _ = run_check(
+        str(clips["moving"]), "--prompt-file", str(prompt_file), "--l1-only",
+        "--thresholds", str(thresholds_permissive),
+        "--json", str(blocker / "v.json"))
+    assert code == 2
+    assert summary.get("verdict") == "ERROR"
+
+
+def _inproc(monkeypatch, tmp_path, clip, thr, prompt, *extra):
+    from shortsloop import check
+    out = tmp_path / "v.json"
+    code = check.main([str(clip), "--prompt-file", str(prompt), "--json", str(out),
+                       "--thresholds", str(thr), *extra])
+    return code, out
+
+
+def test_off_schema_verdict_is_downgraded_to_infra_error(clips, thresholds_permissive,
+                                                         prompt_file, tmp_path,
+                                                         monkeypatch):
+    from shortsloop import l1 as l1mod
+    real = l1mod.compute_metrics
+
+    def leaky(*a, **kw):
+        m = real(*a, **kw)
+        m["metrics"]["undeclared_metric"] = 1.0          # off the frozen schema
+        return m
+    monkeypatch.setattr(l1mod, "compute_metrics", leaky)
+    code, out = _inproc(monkeypatch, tmp_path, clips["moving"], thresholds_permissive,
+                        prompt_file, "--l1-only")
+    assert code == 2
+    v = load_verdict(out)                    # the downgraded verdict itself validates
+    assert v["verdict"] == "ERROR" and v["error"]["scope"] == "infra"
+
+
+def test_non_finite_metric_never_leaks_into_json(clips, thresholds_permissive,
+                                                 prompt_file, tmp_path, monkeypatch):
+    from shortsloop import l1 as l1mod
+    real = l1mod.compute_metrics
+
+    def nan(*a, **kw):
+        m = real(*a, **kw)
+        m["metrics"]["ssim_min"] = float("nan")
+        return m
+    monkeypatch.setattr(l1mod, "compute_metrics", nan)
+    code, out = _inproc(monkeypatch, tmp_path, clips["moving"], thresholds_permissive,
+                        prompt_file, "--l1-only")
+    assert code == 2
+    text = out.read_text()
+    assert "NaN" not in text
+    json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    assert load_verdict(out)["verdict"] == "ERROR"
+
+
+def test_unexpected_l2_crash_reports_stage_l2(clips, thresholds_permissive, prompt_file,
+                                             tmp_path, monkeypatch):
+    from shortsloop import l2 as l2mod
+
+    def boom(*a, **kw):
+        raise KeyError("floors")
+    monkeypatch.setattr(l2mod, "run_l2", boom)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("judge: {adapter: ollama, base_url: 'http://127.0.0.1:9', model: m}\n")
+    code, out = _inproc(monkeypatch, tmp_path, clips["moving"], thresholds_permissive,
+                        prompt_file, "--config", str(cfg))
+    assert code == 2
+    v = load_verdict(out)
+    assert v["error"]["stage"] == "l2" and v["error"]["scope"] == "infra"

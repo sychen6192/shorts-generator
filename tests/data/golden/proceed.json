@@ -1,0 +1,139 @@
+{
+  "schema_version": "1",
+  "verdict": "PROCEED",
+  "failure_classes": [],
+  "error": null,
+  "clip": {
+    "path": "runs/RUN/clips/proceed.mp4",
+    "sha256": "f14f1652b876333e68449cb411c21d199dc0c8b47c46d0ac9e682a0845acdd87",
+    "container": {
+      "duration_s": 3.0,
+      "width": 480,
+      "height": 832,
+      "fps": 16.0,
+      "nb_frames": 48,
+      "vcodec": "h264"
+    }
+  },
+  "prompt": {
+    "text": "A red cube sliding across a dark slate table, slow dolly-in, vertical 9:16 composition.",
+    "sha256": "dbffdb1448f5c2b1e1d2e15a37d1bb6f86782318533f81258f32d108ccc164eb"
+  },
+  "l1": {
+    "analysis": {
+      "width": 480,
+      "height": 832,
+      "flow_downscale": 2,
+      "frames_analyzed": 48
+    },
+    "metrics": {
+      "flow_mag_median": 0.0032001637772268226,
+      "flow_mag_p90": 0.003207102672378732,
+      "ssim_min": 0.7008061408996582,
+      "ssim_p05": 0.7008652091026306,
+      "ssim_mean": 0.7018678885825137,
+      "flicker_dips": 0,
+      "freeze_longest_run_s": 0.0,
+      "laplacian_p10": 71.40100021362305,
+      "laplacian_median": 79.23603820800781,
+      "luma_mean": 0.5044458160797755,
+      "black_frame_frac": 0.0,
+      "clipped_frac": 0.01231136485042735
+    },
+    "checks": [
+      {
+        "name": "spec",
+        "metric": "container",
+        "op": "match",
+        "threshold": null,
+        "value": null,
+        "pass": true,
+        "reason": "container matches expectations"
+      },
+      {
+        "name": "black",
+        "metric": "black_frame_frac",
+        "op": "<=",
+        "threshold": 1.0,
+        "value": 0.0,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "exposure",
+        "metric": "clipped_frac",
+        "op": "<=",
+        "threshold": 1.0,
+        "value": 0.01231136485042735,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "flicker",
+        "metric": "flicker_dips",
+        "op": "<=",
+        "threshold": 1000000000.0,
+        "value": 0,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "freeze",
+        "metric": "freeze_longest_run_s",
+        "op": "<=",
+        "threshold": 1000000000.0,
+        "value": 0.0,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "motion",
+        "metric": "flow_mag_median",
+        "op": ">=",
+        "threshold": 0.0015,
+        "value": 0.0032001637772268226,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "sharpness",
+        "metric": "laplacian_p10",
+        "op": ">=",
+        "threshold": 0.0,
+        "value": 71.40100021362305,
+        "pass": true,
+        "reason": "ok"
+      },
+      {
+        "name": "ssim_floor",
+        "metric": "ssim_min",
+        "op": ">=",
+        "threshold": 0.0,
+        "value": 0.7008061408996582,
+        "pass": true,
+        "reason": "ok"
+      }
+    ],
+    "pass": true
+  },
+  "l2": null,
+  "thresholds": {
+    "version": "test.1",
+    "calibrated": true,
+    "file_sha256": "807f5ba8ac8114cb97b7b2ca6328ee47f982c3e4f66f407ae4c25ec895c36b41"
+  },
+  "layers_run": [
+    "l1"
+  ],
+  "timing": {
+    "l1_s": 0.5,
+    "l2_s": null
+  },
+  "versions": {
+    "checker": "0.1.0",
+    "python": "3.11.15",
+    "opencv": "5.0.0",
+    "numpy": "2.4.6",
+    "ffprobe": "6.1.1-3ubuntu5"
+  }
+}

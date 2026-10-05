@@ -36,9 +36,12 @@ def test_slate_mix_and_determinism():
 def _batch_config(tmp_path, comfy_host) -> Path:
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump({
-        "comfy": {"host": comfy_host, "workflow_t2v": str(DATA / "test_workflow.json"),
-                  "timeout_s": 60},
+        "comfy": {"host": comfy_host, "workflow_t2v": str(DATA / "test_workflow.json")},
+        "paths": {"runs_dir": str(tmp_path / "runs")},
     }), encoding="utf-8")
+    (tmp_path / "pipeline.yaml").write_text(yaml.safe_dump({"policies": {
+        "comfy": {"timeout_s": 60, "poll_s": 1},
+        "vram_handoff": {"free_min_gb": 20, "wait_timeout_s": 5}}}), encoding="utf-8")
     return cfg
 
 
@@ -47,7 +50,9 @@ def test_batch_generates_manifest_and_swaps(clips, tmp_path):
     with serve_comfy(fixture_paths=clips) as comfy:
         cfg = _batch_config(tmp_path, comfy.host)
         out = tmp_path / "calibration"
-        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(7)) == 0
+        pipe = str(tmp_path / "pipeline.yaml")
+        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(7),
+                         pipeline_path=pipe) == 0
         rows = _read_jsonl(out / "batch_manifest.jsonl")
         gen = [r for r in rows if r["kind"] != "swap"]
         swaps = [r for r in rows if r["kind"] == "swap"]
@@ -63,7 +68,8 @@ def test_batch_generates_manifest_and_swaps(clips, tmp_path):
         subs_before = len(comfy.submissions)
 
         # resume: nothing regenerated, manifest unchanged
-        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(8)) == 0
+        assert run_batch(str(cfg), str(out), count=5, rng=random.Random(8),
+                         pipeline_path=pipe) == 0
         assert len(comfy.submissions) == subs_before
         assert len(_read_jsonl(out / "batch_manifest.jsonl")) == 9
 
@@ -167,19 +173,10 @@ def test_label_server_rejects_bad_payloads(clips, tmp_path):
 # ------------------------------------------------------------------ tuner
 
 def _mk_cal(tmp_path, rows, labels):
-    cal = tmp_path / "cal"
-    cal.mkdir()
-    with open(cal / "batch_manifest.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-    with open(cal / "metrics.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps({"clip_id": r["clip_id"], "metrics": r["_m"]}) + "\n")
-    with open(cal / "labels.jsonl", "w") as f:
-        for cid, (verdict, classes) in labels.items():
-            f.write(json.dumps({"clip_id": cid, "verdict": verdict,
-                                "classes": classes, "ts": 1}) + "\n")
-    return cal
+    """Real (tiny) clip files, metrics cached under each clip's sha, labels that
+    carry the labeled clip's sha — the tuner only trusts labels it can verify."""
+    from test_calibrate_tune import mk_cal
+    return mk_cal(tmp_path, rows, labels)
 
 
 BASE_M = {"flow_mag_median": 0.003, "flow_mag_p90": 0.004, "ssim_min": 0.7,
@@ -240,12 +237,14 @@ def test_tuner_separates_and_reports(tmp_path):
         "motion", "freeze", "flicker", "ssim_floor", "sharpness", "black", "exposure"}
 
 
-def test_approve_flips_calibrated_with_provenance(tmp_path):
+def test_approve_flips_calibrated_with_provenance(tmp_path, capsys):
     rows, labels = _rows_and_labels()
     cal = _mk_cal(tmp_path, rows, labels)
     assert run_tune(str(cal)) == 0
     target = tmp_path / "thresholds.yaml"
-    assert run_tune(str(cal), approve=True, target=str(target)) == 0
+    # L1-only fixture (no judge scores): signing it off is the supervised exception
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 0
     thr, info = load_thresholds(target)
     assert info["calibrated"] is True
     data = yaml.safe_load(target.read_text())
@@ -255,7 +254,10 @@ def test_approve_flips_calibrated_with_provenance(tmp_path):
     with open(cal / "labels.jsonl", "a") as f:
         f.write(json.dumps({"clip_id": "p0", "verdict": "fail",
                             "classes": ["other"], "ts": 2}) + "\n")
-    assert run_tune(str(cal), approve=True, target=str(target)) == 2
+    capsys.readouterr()
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 2
+    assert "labels.jsonl changed since tuning" in capsys.readouterr().out
 
 
 def test_split_is_stratified_and_deterministic():
@@ -288,3 +290,52 @@ def test_wilson_ci_sane():
     assert lo == 0.0 and 0.2 < hi < 0.3        # n=12, zero events → CI up to ~24%
     lo2, hi2 = wilson(3, 12)
     assert lo2 > 0.05 and hi2 < 0.6
+
+
+def test_untuned_detectors_get_guard_rails_never_null(tmp_path):
+    """The Phase 0 slate has no flicker category: flicker/ssim_floor have no labeled
+    examples. The proposal must still be shape-valid (no `value: null` that would
+    crash every checker run after sign-off) and say UNTUNED loudly."""
+    from shortsloop.thresholds import validate_thresholds
+    rows, labels = _rows_and_labels()
+    keep = {c for c in labels if not c.startswith("f")}          # drop flicker clips
+    rows = [r for r in rows if r["clip_id"] in keep]
+    labels = {c: v for c, v in labels.items() if c in keep}
+    cal = _mk_cal(tmp_path, rows, labels)
+    assert run_tune(str(cal)) == 0
+    proposed = yaml.safe_load((cal / "thresholds.proposed.yaml").read_text())
+    assert validate_thresholds({**proposed, "calibrated": True}) == []
+    good_dips = [r["_m"]["flicker_dips"] for r in rows if labels[r["clip_id"]][0] == "pass"]
+    good_ssim = [r["_m"]["ssim_min"] for r in rows if labels[r["clip_id"]][0] == "pass"]
+    assert proposed["l1"]["flicker"]["value"] >= max(good_dips)   # never fails a pass
+    assert proposed["l1"]["ssim_floor"]["value"] <= min(good_ssim)
+    report = (cal / "tuning_report.md").read_text()
+    assert "UNTUNED" in report and "flicker" in report
+
+    target = tmp_path / "thresholds.yaml"
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 0                # L1-only fixture
+    load_thresholds(target)                                       # checker accepts it
+
+
+def test_approve_refuses_off_shape_proposal(tmp_path, capsys):
+    """The approve-time shape validation (plan §2.4) ALONE must refuse this: the
+    values hash is recomputed for the edited values (an old tuner / a script), and
+    the L1-only exception is granted, so no other gate can be what refuses."""
+    from shortsloop.calibrate.tune import _values_sha
+    rows, labels = _rows_and_labels()
+    cal = _mk_cal(tmp_path, rows, labels)
+    assert run_tune(str(cal)) == 0
+    p = cal / "thresholds.proposed.yaml"
+    data = yaml.safe_load(p.read_text())
+    data["l1"]["flicker"]["value"] = None                # hand-edited / old tuner
+    data["provenance"]["values_sha256"] = _values_sha({"l1": data["l1"],
+                                                       "l2": data["l2"]})
+    p.write_text(yaml.safe_dump(data))
+    target = tmp_path / "thresholds.yaml"
+    capsys.readouterr()
+    assert run_tune(str(cal), approve=True, target=str(target),
+                    accept_untested_l2=True) == 2
+    out = capsys.readouterr().out
+    assert "off the frozen thresholds shape" in out and "l1.flicker.value" in out
+    assert not target.exists()                          # nothing signed off

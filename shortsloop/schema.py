@@ -5,8 +5,9 @@ The schema file (verdict.schema.json) is the frozen wire contract (docs/plan.md
 express (PASS ⇒ layers_run == [l1,l2], etc.). Both run on every verdict in tests.
 
 The validator supports the subset of JSON Schema used by our schema files:
-type (string or list), properties, required, items, enum, additionalProperties
-(bool), minimum/maximum for numbers, and $ref into #/$defs/.
+type (string or list), properties, required, items, enum, const,
+additionalProperties (bool), minimum/maximum for numbers, minItems/maxItems, and
+$ref into #/$defs/.
 """
 
 from __future__ import annotations
@@ -23,6 +24,12 @@ _TYPES = {
     "boolean": bool,
     "null": type(None),
 }
+
+
+def _same(a, b) -> bool:
+    """JSON equality: True is not 1 (bool is an int subclass in Python)."""
+    return type(a) is type(b) and a == b if isinstance(a, bool) or isinstance(b, bool) \
+        else a == b
 
 
 def load_schema() -> dict:
@@ -60,8 +67,10 @@ def check_schema(instance, schema: dict, path: str = "$", root: dict | None = No
             return errs
         if instance is None and "null" in tlist:
             return errs
-    if "enum" in schema and instance not in schema["enum"]:
+    if "enum" in schema and not any(_same(instance, e) for e in schema["enum"]):
         errs.append(f"{path}: {instance!r} not in enum {schema['enum']}")
+    if "const" in schema and not _same(instance, schema["const"]):
+        errs.append(f"{path}: {instance!r} != const {schema['const']!r}")
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
         if "minimum" in schema and instance < schema["minimum"]:
             errs.append(f"{path}: {instance} < minimum {schema['minimum']}")
@@ -79,6 +88,11 @@ def check_schema(instance, schema: dict, path: str = "$", root: dict | None = No
             extra = set(instance) - set(props)
             if extra:
                 errs.append(f"{path}: unexpected keys {sorted(extra)}")
+    if isinstance(instance, list):
+        if "minItems" in schema and len(instance) < schema["minItems"]:
+            errs.append(f"{path}: {len(instance)} items < minItems {schema['minItems']}")
+        if "maxItems" in schema and len(instance) > schema["maxItems"]:
+            errs.append(f"{path}: {len(instance)} items > maxItems {schema['maxItems']}")
     if isinstance(instance, list) and "items" in schema:
         for i, item in enumerate(instance):
             errs.extend(check_schema(item, schema["items"], f"{path}[{i}]", root))

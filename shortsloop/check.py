@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,7 +27,9 @@ import yaml
 
 from . import l1, l2
 from .errors import CheckError, ClipError, InfraError
-from .verdict import EXIT_BY_VERDICT, assemble, sha256_file, validate
+from .thresholds import validate_thresholds
+from .schema import validate_verdict_file
+from .verdict import EXIT_BY_VERDICT, assemble, sha256_file
 
 
 def load_thresholds(path: str | Path) -> tuple[dict, dict]:
@@ -38,11 +42,13 @@ def load_thresholds(path: str | Path) -> tuple[dict, dict]:
         data = yaml.safe_load(p.read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
         raise InfraError("l1", f"thresholds file unparseable: {e}")
-    if not isinstance(data, dict) or "l1" not in data or "l2" not in data:
-        raise InfraError("l1", f"thresholds file missing l1/l2 sections: {p}")
+    problems = validate_thresholds(data)
+    if problems:
+        raise InfraError("l1", f"thresholds file {p} is off the frozen shape "
+                               f"(plan §2.4): " + "; ".join(problems))
     info = {
-        "version": str(data.get("version", "unversioned")),
-        "calibrated": bool(data.get("calibrated", False)),
+        "version": data["version"],
+        "calibrated": data["calibrated"] is True,
         "file_sha256": sha256_file(p),
     }
     return data, info
@@ -68,17 +74,31 @@ def load_judge_config(path: str | Path | None) -> dict:
     )
 
 
+def _write_raw(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 def _emit(v: dict, json_path: str | None) -> int:
-    problems = validate(v)
+    """Validate (frozen schema + invariants), write atomically, print the VERDICT
+    line. An off-contract verdict is an instrument bug: infra ERROR (fail closed)."""
+    problems = validate_verdict_file(v)
     if problems:
-        # A malformed verdict is an instrument bug: report as infra ERROR (fail closed).
+        stage = "l2" if "l2" in (v.get("layers_run") or []) else "l1"
         v = {**v, "verdict": "ERROR", "failure_classes": [],
-             "error": {"scope": "infra", "stage": "l1",
-                       "message": "internal: verdict failed invariants: " + "; ".join(problems)}}
+             "error": {"scope": "infra", "stage": stage,
+                       "message": "internal: verdict failed schema/invariants: "
+                                  + "; ".join(problems)[:2000]}}
+        if validate_verdict_file(v):     # the offending block itself is off-schema
+            v = {**v, "l1": None, "l2": None, "layers_run": []}
     if json_path:
-        Path(json_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(json_path).write_text(json.dumps(v, indent=2, ensure_ascii=False) + "\n",
-                                   encoding="utf-8")
+        out = Path(json_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp")
+        # allow_nan=False: the verdict file is strict JSON for every consumer
+        tmp.write_text(json.dumps(v, indent=2, ensure_ascii=False, allow_nan=False)
+                       + "\n", encoding="utf-8")
+        os.replace(tmp, out)             # never a torn verdict file
     print("VERDICT " + json.dumps({
         "verdict": v["verdict"],
         "failure_classes": v["failure_classes"],
@@ -88,7 +108,29 @@ def _emit(v: dict, json_path: str | None) -> int:
     return EXIT_BY_VERDICT[v["verdict"]]
 
 
+def _emit_crash(e: BaseException) -> int:
+    """Last line of defense: the checker itself broke outside evaluation (e.g. the
+    verdict could not be written). Exit 2 = ERROR — never 1 (FAIL) or 0."""
+    print(f"shortsloop-check: internal failure: {type(e).__name__}: {e}",
+          file=sys.stderr)
+    print("VERDICT " + json.dumps({
+        "verdict": "ERROR", "failure_classes": [],
+        "error": {"scope": "infra", "stage": "l1",
+                  "message": f"checker crashed: {type(e).__name__}: {e}"[:500]},
+        "json": None}, ensure_ascii=False))
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SystemExit:
+        raise                    # argparse usage errors already exit 2
+    except Exception as e:
+        return _emit_crash(e)
+
+
+def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="shortsloop-check",
         description=__doc__,
@@ -121,8 +163,13 @@ def main(argv: list[str] | None = None) -> int:
     error_obj = None
     thresholds_info = {"version": None, "calibrated": False, "file_sha256": None}
     timing: dict = {"l1_s": None, "l2_s": None}
+    stage = "l1"                 # where an unexpected failure is attributed
+    raw_path = (Path(args.json_out).with_suffix(".l2_raw.json")
+                if args.json_out else None)
 
     try:
+        if raw_path is not None:  # a previous run's reply is not evidence for this one
+            raw_path.unlink(missing_ok=True)
         thresholds, thresholds_info = load_thresholds(args.thresholds)
 
         try:
@@ -131,8 +178,14 @@ def main(argv: list[str] | None = None) -> int:
             raise ClipError("probe", f"cannot read prompt file: {e}")
 
         t0 = time.monotonic()
+        stage = "probe"
         container = l1.probe(clip_path)
+        stage = "l1"
         metrics = l1.compute_metrics(clip_path, fps_hint=container.get("fps"))
+        bad = [k for k, x in metrics["metrics"].items()
+               if not isinstance(x, (int, float)) or not math.isfinite(x)]
+        if bad:
+            raise ClipError("l1", f"non-finite L1 metric(s) {bad} — clip not measurable")
         checks = [l1.spec_check(container, metrics["analysis"]["frames_analyzed"], expect)]
         checks += l1.run_checks(metrics["metrics"], thresholds["l1"])
         l1_block = {
@@ -145,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         timing["l1_s"] = round(time.monotonic() - t0, 3)
 
         if not args.l1_only and l1_block["pass"]:
+            stage = "l2"
             judge_cfg = load_judge_config(args.config)
             floors = thresholds["l2"]["floors"]
             t1 = time.monotonic()
@@ -152,15 +206,22 @@ def main(argv: list[str] | None = None) -> int:
                                          judge_cfg, floors)
             layers_run.append("l2")
             timing["l2_s"] = round(time.monotonic() - t1, 3)
-            if args.json_out:  # raw judge output kept for audit next to the verdict
-                raw_path = Path(args.json_out).with_suffix(".l2_raw.json")
-                raw_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_path.write_text(l2_raw, encoding="utf-8")
+            if raw_path is not None:  # raw judge output kept for audit beside the verdict
+                _write_raw(raw_path, l2_raw)
 
     except CheckError as e:
         error_obj = e.as_error_obj()
+        # The judge's last reply (if any) is the only evidence of WHY L2 errored —
+        # keep it beside the ERROR verdict too. Best effort: never changes the verdict.
+        raw = getattr(e, "raw", None)
+        if raw_path is not None and isinstance(raw, str):
+            try:
+                _write_raw(raw_path, raw)
+            except OSError as w:
+                print(f"shortsloop-check: could not keep raw judge reply: {w}",
+                      file=sys.stderr)
     except Exception as e:  # unexpected bug in the checker = broken instrument
-        error_obj = {"scope": "infra", "stage": "l1",
+        error_obj = {"scope": "infra", "stage": stage,
                      "message": f"unexpected checker failure: {type(e).__name__}: {e}"}
 
     v = assemble(

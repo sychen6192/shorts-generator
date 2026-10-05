@@ -10,13 +10,21 @@ order is shuffled with a fixed seed so swap rows don't sit next to their source.
 
 Keys:  1 pass · 2 static · 3 deformed · 4 flicker · 5 off-prompt · 6 other(+note)
        space replay · p previous · n skip
+One label per key press: held keys (auto-repeat) are ignored and keys are locked
+while a label is being written, so a fast correction can never skip a clip.
+
+Serving: clips support single byte-range requests (206), which Safari requires for
+<video>. Binds 127.0.0.1 by default (no auth) — reach it from a laptop through an
+SSH tunnel, or pass --host to bind a LAN address deliberately.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +53,7 @@ PAGE = """<!doctype html>
   #keys div { margin:.3rem 0; }
   #last { color:#7a7; min-height:1.5em; }
   #done { display:none; font-size:1.4rem; color:#8f8; }
+  #end { color:#fa6; font-size:1.2rem; }
 </style>
 <div id="left"><video id="v" autoplay loop muted playsinline></video></div>
 <div id="right">
@@ -62,6 +71,7 @@ PAGE = """<!doctype html>
          <span class="key">p</span> previous · <span class="key">n</span> skip</div>
   </div>
   <div id="last"></div>
+  <div id="end"></div>
   <div id="done">All clips labeled — you can close this tab.
     <br>Labels: <code id="outpath"></code></div>
 </div>
@@ -71,6 +81,7 @@ let order = DATA.rows;
 let idx = order.findIndex(r => !DATA.labeled.includes(r.clip_id));
 if (idx < 0) idx = order.length;
 let shownAt = Date.now();
+let busy = false;            // a label POST is in flight: every key is ignored
 const v = document.getElementById("v");
 document.getElementById("outpath").textContent = DATA.labels_path;
 
@@ -79,8 +90,15 @@ function show() {
   const done = order.filter(r => DATA.labeled.includes(r.clip_id)).length;
   document.getElementById("progress").textContent =
       `clip ${Math.min(idx + 1, total)} / ${total} — ${done} labeled`;
+  document.getElementById("end").textContent = "";
   if (idx >= total) {
-    document.getElementById("done").style.display = "block";
+    if (done === total) {
+      document.getElementById("done").style.display = "block";
+    } else {
+      document.getElementById("end").textContent =
+          `End of list — ${total - done} clip(s) still unlabeled. Press p to go ` +
+          `back, or reload to jump to the first unlabeled clip.`;
+    }
     v.removeAttribute("src"); v.load();
     return;
   }
@@ -92,23 +110,32 @@ function show() {
 }
 
 async function send(verdict, classes, note) {
-  const row = order[idx];
-  const res = await fetch("/label", {method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({clip_id: row.clip_id, verdict: verdict,
-                          classes: classes, note: note || "",
-                          ms: Date.now() - shownAt})});
-  if (!res.ok) { alert("label write failed: " + await res.text()); return; }
-  if (!DATA.labeled.includes(row.clip_id)) DATA.labeled.push(row.clip_id);
-  document.getElementById("last").textContent =
-      `${row.clip_id}: ${verdict}${classes.length ? " (" + classes + ")" : ""}`;
-  idx += 1; show();
+  if (busy || idx >= order.length) return;
+  busy = true;
+  const at = idx, row = order[at];          // the clip on screen at key press
+  try {
+    const res = await fetch("/label", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({clip_id: row.clip_id, verdict: verdict,
+                            classes: classes, note: note || "",
+                            ms: Date.now() - shownAt})});
+    if (!res.ok) { alert("label write failed: " + await res.text()); return; }
+    if (!DATA.labeled.includes(row.clip_id)) DATA.labeled.push(row.clip_id);
+    document.getElementById("last").textContent =
+        `${row.clip_id}: ${verdict}${classes.length ? " (" + classes + ")" : ""}`;
+    idx = at + 1; show();
+  } catch (err) {
+    alert("label write failed: " + err);
+  } finally {
+    busy = false;
+  }
 }
 
 const KEYMAP = {"1": ["pass", []], "2": ["fail", ["static"]],
                 "3": ["fail", ["deformed"]], "4": ["fail", ["flicker"]],
                 "5": ["fail", ["off_prompt"]]};
 document.addEventListener("keydown", (e) => {
+  if (e.repeat || busy) return;             // held key / label still being written
   if (e.key === " ") { e.preventDefault(); v.currentTime = 0; v.play(); return; }
   if (e.key === "p") { idx = Math.max(0, idx - 1); show(); return; }
   if (e.key === "n") { idx = Math.min(order.length, idx + 1); show(); return; }
@@ -143,12 +170,35 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _send(self, body: bytes, ctype: str, code: int = 200):
+    def _send(self, body: bytes, ctype: str, code: int = 200,
+              headers: dict | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for key, val in (headers or {}).items():
+            self.send_header(key, val)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_clip(self, path: str) -> None:
+        """Whole file (200) or ONE byte range (206) — Safari will not play <video>
+        from a server without range support. Multi-range requests get the whole
+        file (allowed by RFC 9110); unsatisfiable ranges get 416."""
+        size = os.path.getsize(path)
+        span = _parse_range(self.headers.get("Range"), size)
+        if span == "unsatisfiable":
+            self._send(b"", "video/mp4", 416, {"Content-Range": f"bytes */{size}",
+                                               "Accept-Ranges": "bytes"})
+            return
+        with open(path, "rb") as f:
+            if span is None:
+                self._send(f.read(), "video/mp4", 200, {"Accept-Ranges": "bytes"})
+                return
+            start, end = span
+            f.seek(start)
+            body = f.read(end - start + 1)
+        self._send(body, "video/mp4", 206, {"Accept-Ranges": "bytes",
+                                            "Content-Range": f"bytes {start}-{end}/{size}"})
 
     def do_GET(self):
         srv: LabelServer = self.server  # type: ignore[assignment]
@@ -167,7 +217,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not path or not Path(path).is_file():
                 self._send(b"clip not found", "text/plain", 404)
                 return
-            self._send(Path(path).read_bytes(), "video/mp4")
+            self._send_clip(path)
         else:
             self._send(b"not found", "text/plain", 404)
 
@@ -206,26 +256,71 @@ class _Handler(BaseHTTPRequestHandler):
                    "application/json")
 
 
-def make_server(cal_dir: str | Path, port: int = 0) -> LabelServer:
+def _parse_range(header: str | None, size: int):
+    """None (serve whole file), "unsatisfiable", or an inclusive (start, end)."""
+    if not header:
+        return None
+    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", header)
+    if not m or (not m.group(1) and not m.group(2)):
+        return None                                  # malformed / multi-range
+    if not m.group(1):                               # suffix: last N bytes
+        n = int(m.group(2))
+        if n == 0 or size == 0:
+            return "unsatisfiable"
+        return max(0, size - n), size - 1
+    start = int(m.group(1))
+    end = int(m.group(2)) if m.group(2) else size - 1
+    if start >= size or end < start:
+        return "unsatisfiable"
+    return start, min(end, size - 1)
+
+
+def resolve_clip_path(cal: Path, path: str | None) -> str | None:
+    """Manifest paths may be relative to the directory calibrate-batch ran in;
+    fall back to the standard <calibration>/clips/<name> layout."""
+    if not path:
+        return path
+    p = Path(path)
+    if not p.is_file() and not p.is_absolute() and (cal / "clips" / p.name).is_file():
+        return str(cal / "clips" / p.name)
+    return path
+
+
+def make_server(cal_dir: str | Path, port: int = 0,
+                host: str = "127.0.0.1") -> LabelServer:
     cal = Path(cal_dir)
     manifest = cal / "batch_manifest.jsonl"
     rows = _read_jsonl(manifest)
     if not rows:
         raise SystemExit(f"[label] no rows in {manifest} — run calibrate-batch first")
+    rows = [{**r, "clip_path": resolve_clip_path(cal, r.get("clip_path"))} for r in rows]
     random.Random(42).shuffle(rows)   # blind the labeler to batch structure
-    return LabelServer(("127.0.0.1", port), rows, cal / "labels.jsonl")
+    return LabelServer((host, port), rows, cal / "labels.jsonl")
 
 
 def main_label(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="shortsloop label")
     ap.add_argument("--calibration", default="calibration")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (default 127.0.0.1; the UI has NO auth — "
+                         "prefer an SSH tunnel over binding a LAN address)")
     args = ap.parse_args(argv)
-    srv = make_server(args.calibration, args.port)
+    srv = make_server(args.calibration, args.port, args.host)
     n = len(srv.rows)
     done = len(srv.labeled_ids())
+    port = srv.server_address[1]
     print(f"[label] {n} clips ({done} already labeled) — open "
-          f"http://127.0.0.1:{srv.server_address[1]}/  (Ctrl-C to stop)")
+          f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{port}/"
+          f"  (Ctrl-C to stop)")
+    if args.host in ("127.0.0.1", "localhost", "::1"):
+        print(f"[label] headless workstation? From your laptop run\n"
+              f"          ssh -L {port}:127.0.0.1:{port} <workstation>\n"
+              f"        then open http://127.0.0.1:{port}/ there "
+              f"(or pass --host <LAN address> to bind it directly — no auth).")
+    else:
+        print(f"[label] bound to {args.host}:{port} — anyone who can reach that "
+              f"address can label (no auth); stop the server when done.")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

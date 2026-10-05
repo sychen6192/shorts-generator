@@ -85,3 +85,36 @@ def test_full_mode_garbage_judge_is_clip_error(clips, thresholds_permissive, pro
     v = load_verdict(out)
     assert v["error"]["scope"] == "clip"
     assert v["error"]["stage"] == "l2"
+
+
+def test_full_mode_error_keeps_raw_judge_reply(clips, thresholds_permissive, prompt_file,
+                                               tmp_path):
+    """A clip-scope L2 ERROR (judge garbage after retry) leaves the raw reply next to
+    the verdict, so a halted night has evidence to diagnose."""
+    out = tmp_path / "v.json"
+    with serve(scenario="garbage") as (srv, url):
+        code, summary, _ = run_check(
+            str(clips["moving"]), "--prompt-file", str(prompt_file),
+            "--thresholds", str(thresholds_permissive),
+            "--config", str(write_config(tmp_path, url)), "--json", str(out))
+    assert code == 2
+    v = load_verdict(out)
+    assert v["verdict"] == "ERROR" and v["l2"] is None
+    raw_path = out.with_suffix(".l2_raw.json")
+    assert raw_path.is_file(), "raw judge reply not kept on ERROR"
+    assert raw_path.read_text(encoding="utf-8") == "the clip looks fine to me, PASS!"
+
+
+def test_stale_raw_reply_not_left_beside_new_verdict(clips, thresholds_permissive,
+                                                     prompt_file, tmp_path):
+    """Re-checking into the same verdict path must not leave a previous run's raw
+    reply masquerading as evidence for this verdict."""
+    out = tmp_path / "v.json"
+    raw_path = out.with_suffix(".l2_raw.json")
+    raw_path.write_text("STALE", encoding="utf-8")
+    code, _, _ = run_check(
+        str(clips["moving"]), "--prompt-file", str(prompt_file),
+        "--thresholds", str(thresholds_permissive),
+        "--config", str(write_config(tmp_path, "http://127.0.0.1:9")), "--json", str(out))
+    assert code == 2
+    assert not raw_path.exists()

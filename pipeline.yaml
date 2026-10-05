@@ -19,6 +19,9 @@ policies:
     infra_escalation_after: 2       # consecutive clip-scope L2 errors → infra halt
   vram_handoff:
     free_min_gb: 24                 # /system_stats must report at least this after /free
+    # gen_free_min_gb: 28           # optional, judge->generation direction only: set it
+    #                               # so an idle card clears it but one with the VLM
+    #                               # still resident does not (runbook §6)
     wait_timeout_s: 180             # else infra ERROR: halt (hard rule 3)
 resources:
   comfy_host: ${COMFY_HOST}         # machine-local values resolve via config.yaml/env

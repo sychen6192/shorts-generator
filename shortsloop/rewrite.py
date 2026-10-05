@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -25,25 +26,68 @@ words; keep the trailing 'vertical 9:16 composition' phrase if present. Return J
 only: {"rewritten_prompt": "..."}."""
 
 
+def effective_rewrite_cfg(cfg: dict) -> dict:
+    """config.yaml `rewrite:` with its server resolved: rewrite.base_url, else the
+    judge's Ollama, else local Ollama (an openai_compat judge server does not
+    speak Ollama's /api/chat)."""
+    rw = dict(cfg.get("rewrite") or {})
+    judge = cfg.get("judge") or {}
+    if not rw.get("base_url"):
+        rw["base_url"] = (judge.get("base_url")
+                          if judge.get("adapter", "ollama") == "ollama" and
+                          judge.get("base_url") else "http://127.0.0.1:11434")
+    return rw
+
+
+MAX_WORDS = 110
+_TAIL_RE = re.compile(r"vertical\s+9:16\s+composition", re.I)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def validate_rewrite(original: str, rewritten: str, anchors: list[str] | None) -> list[str]:
+    """The §2.3 contract, enforced in code: ≤110 words, the composition tail kept,
+    and every sheet-anchor phrase present in the original kept verbatim."""
+    problems = []
+    words = len(rewritten.split())
+    if words > MAX_WORDS:
+        problems.append(f"{words} words > {MAX_WORDS}")
+    if _TAIL_RE.search(original) and not _TAIL_RE.search(rewritten):
+        problems.append("dropped the trailing 'vertical 9:16 composition'")
+    orig, new = _norm(original), _norm(rewritten)
+    for anchor in anchors or []:
+        for phrase in re.split(r"[,;，；]", anchor):
+            phrase = _norm(phrase)
+            if len(phrase.split()) >= 2 and phrase in orig and phrase not in new:
+                problems.append(f"dropped anchor phrase {phrase!r}")
+    return problems
+
+
 def rewrite_prompt(original: str, judge_reason: str, cfg: dict,
-                   timeout_s: float = 120) -> tuple[str, str] | None:
-    """Returns (rewritten_prompt, unified_diff) or None if the rewrite could not be
-    obtained (caller falls back to plain re-roll)."""
+                   anchors: list[str] | None = None, timeout_s: float = 120) -> dict:
+    """{"ok": True, "text", "diff"} or {"ok": False, "reason"} — a refused or
+    unavailable rewrite falls back to a plain re-roll, and the reason is logged."""
     if not cfg or not cfg.get("enabled", True):
-        return None
+        return {"ok": False, "reason": "rewrite disabled in config"}
     base_url = str(cfg.get("base_url", "http://127.0.0.1:11434")).rstrip("/")
     model = cfg.get("model")
     if not model:
-        return None
+        return {"ok": False, "reason": "no rewrite.model configured"}
     payload = {
         "model": model,
         "stream": False,
         "format": REWRITE_SCHEMA,
         "options": {"temperature": 0.3, "seed": 7},
+        "keep_alive": 0,          # hard rule 3: never resident into a Wan wave
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content":
-                f"Judge complaint: {judge_reason}\n\nOriginal prompt:\n{original}"},
+                f"Judge complaint: {judge_reason}\n\n"
+                + (f"Anchor phrases (keep verbatim): {' | '.join(anchors)}\n\n"
+                   if anchors else "")
+                + f"Original prompt:\n{original}"},
         ],
     }
     req = urllib.request.Request(
@@ -53,11 +97,15 @@ def rewrite_prompt(original: str, judge_reason: str, cfg: dict,
         with urllib.request.urlopen(req, timeout=timeout_s) as r:
             body = json.loads(r.read())
         text = json.loads(body["message"]["content"])["rewritten_prompt"].strip()
-    except Exception:
-        return None
+    except Exception as e:  # noqa: BLE001 — any failure = plain re-roll, logged
+        return {"ok": False, "reason": f"rewrite unavailable at {base_url}: "
+                                       f"{type(e).__name__}: {e}"[:300]}
     if not text or text == original.strip():
-        return None
+        return {"ok": False, "reason": "rewrite empty or identical to the original"}
+    problems = validate_rewrite(original, text, anchors)
+    if problems:
+        return {"ok": False, "reason": "rewrite broke the contract: " + "; ".join(problems)}
     diff = "\n".join(difflib.unified_diff(
         original.strip().splitlines(), text.splitlines(),
         fromfile="original", tofile="rewritten", lineterm=""))
-    return text, diff
+    return {"ok": True, "text": text, "diff": diff}
