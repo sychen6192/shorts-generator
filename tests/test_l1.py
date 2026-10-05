@@ -136,12 +136,26 @@ def test_flicker_dips_near_zero_on_flicker_free_kinds(all_metrics):
         assert dips == 0, f"{kind} should be flicker-free, got flicker_dips={dips}"
 
 
-def test_repo_placeholder_thresholds_fail_strobes_on_flicker(all_metrics):
-    """With the shipped thresholds.yaml (flicker <= 2) both strobe kinds FAIL the
-    flicker check, while the clean moving clip passes it."""
-    repo_l1 = yaml.safe_load(
-        (Path(__file__).parents[1] / "thresholds.yaml").read_text(encoding="utf-8"))["l1"]
-    flicker_only = {"flicker": repo_l1["flicker"]}
+# The flicker rule as shipped in the placeholder thresholds.yaml. Pinned here rather
+# than read from the repo file: Phase 0 sign-off (`calibrate-tune --approve`)
+# rewrites thresholds.yaml on the workstation, and the suite must stay green there.
+PLACEHOLDER_FLICKER = {"metric": "flicker_dips", "op": "<=", "value": 2}
+
+
+def test_placeholder_flicker_pin_matches_shipped_file():
+    """While the repo thresholds.yaml is still the uncalibrated placeholder, the pin
+    above must equal its flicker rule. A signed-off file belongs to the operator and
+    is not compared (its shape is checked in test_thresholds.py)."""
+    shipped = yaml.safe_load(
+        (Path(__file__).parents[1] / "thresholds.yaml").read_text(encoding="utf-8"))
+    if shipped["calibrated"] is not True:
+        assert shipped["l1"]["flicker"] == PLACEHOLDER_FLICKER
+
+
+def test_placeholder_flicker_rule_fails_strobes(all_metrics):
+    """With the shipped placeholder flicker rule (flicker_dips <= 2) both strobe
+    kinds FAIL the flicker check, while the clean moving clip passes it."""
+    flicker_only = {"flicker": PLACEHOLDER_FLICKER}
     for kind in ("strobe", "strobe_burst", "flicker"):
         (chk,) = l1.run_checks(all_metrics[kind]["metrics"], flicker_only)
         assert chk["pass"] is False, f"{kind} passed the flicker check: {chk}"

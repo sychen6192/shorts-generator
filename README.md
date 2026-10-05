@@ -7,21 +7,25 @@ budgets → encode only the survivors into silent 1080x1920 QC MP4s → wake up 
 morning report instead of a review queue.
 
 ```
+# run from the repo root as .venv/bin/shortsloop … / .venv/bin/shortsloop-check …
+# (the venv is never activated)
 shortsloop-check clip.mp4 --prompt-file prompt.txt --json verdict.json
 # exit 0 PASS · 1 FAIL · 2 ERROR — the ONLY authority on clip quality
 
 shortsloop doctor            # verify the workstation (writes doctor.json)
 shortsloop calibrate-batch   # Phase 0: ~40 draft clips spanning good and bad
 shortsloop label             # you label them (keyboard web UI, ~15 min)
-shortsloop calibrate-tune    # tune thresholds; --approve = human sign-off gate
+shortsloop calibrate-tune --with-l2  # score with the VLM judge + tune; --approve = human sign-off gate
 shortsloop run --dispatch d.md   # the nightly wave loop
-shortsloop report runs/<id>      # re-render a morning report
+shortsloop report <runs_dir>/<run_id>  # re-render a morning report
 ```
 
 Design in [`docs/plan.md`](docs/plan.md) (frozen contracts: verdict schema,
 exit codes, failure classes, re-roll table, stage names), decision history in
 [`docs/brainstorm.md`](docs/brainstorm.md), workstation setup in
-[`docs/runbook.md`](docs/runbook.md), hard rules in [`CLAUDE.md`](CLAUDE.md).
+[`docs/runbook.md`](docs/runbook.md) (step-by-step zh-TW checklist:
+[`docs/workstation-checklist.md`](docs/workstation-checklist.md)), hard rules in
+[`CLAUDE.md`](CLAUDE.md).
 
 Principles: the verdict comes from the checker's exit code, nothing else; fail
 closed everywhere; Wan and the VLM never share VRAM (verified, not assumed);
@@ -30,5 +34,5 @@ from append-only JSONL.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -q   # ~300 tests, CPU-only: synthetic fixtures + fake ComfyUI/judge
+.venv/bin/pytest -q   # 453 tests (~15 min), CPU-only: synthetic fixtures + fake ComfyUI/judge
 ```
