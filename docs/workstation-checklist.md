@@ -377,9 +377,11 @@ $EDITOR config.yaml                               # 改 judge.model
   - held-out 分出來的 test 集缺少 pass 或缺少 fail（訊息結尾是 `label more`）。
   - judge 只評了一部分的片。
   - 標註全部 `stale/unverifiable`：clip 檔不在 manifest 記錄的絕對路徑上（repo 或 `calibration/` 被搬過，見第 1 步「重新 clone」）。
-- exit 2，但是 `--with-l2` 在打分前就拒絕（**舊的提案會留著**）：沒有 manifest、config 或 pipeline 不能用、GPU 鎖被佔用、缺 `comfy.host`、openai_compat 沒設 `unload_url`。
+- exit 2，但是 `--with-l2` 在打分前就拒絕（**舊的提案會留著**）：沒有 manifest、config.yaml 不存在／無法解析或沒有 `judge:` 區段、pipeline 不能用、GPU 鎖被佔用、缺 `comfy.host`、openai_compat 沒設 `unload_url`。
+- exit 2，`judge.adapter '<x>' has no judge.unload_url`，但 `<x>` 不是 openai_compat：`adapter` 名稱拼錯（不是 ollama／openai_compat），被當成沒設 unload_url 先拒絕。請改正拼字，不要去加 unload_url；doctor 的 `judge.model` 會顯示 `unknown judge adapter`。
 - 要「label more」的話：`.venv/bin/shortsloop calibrate-batch --count 56`（或更多）。前 40 列和原本相同，已在 manifest 裡會被跳過，只會生成 cal041 之後的片。接著跑 `label`（從還沒標的片開始，已標過的按 `n` 跳過），再跑 4c `--with-l2`（只會評新的片），最後 4d。
 - exit 3：
+  - `judge:` 區段缺 `base_url`／`model`（`INFRA: judge config needs base_url and model`），或 `adapter` 拼錯但有設 `unload_url`（`unknown judge adapter`）：改好 config.yaml，再重跑 doctor。
   - judge 連不上，或模型沒 pull。
   - 判讀前 VRAM 驗證不過。
   - judge 在中途掛掉。已經評好的分數會保留，重跑會接著評。
@@ -393,7 +395,7 @@ $EDITOR config.yaml                               # 改 judge.model
 ```bash
 .venv/bin/shortsloop calibrate-tune --approve; echo "exit=$?"
 git diff --stat thresholds.yaml
-B=/data/shortsloop/backup/$(date +%F); mkdir -p "$B" && cp -a calibration config.yaml thresholds.yaml pipeline.yaml "$B"/   # 備份
+B=/data/shortsloop/backup/$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$B" && cp -a calibration config.yaml thresholds.yaml pipeline.yaml "$B"/   # 備份：每次一個新資料夾，同一天重新簽核也不會蓋掉舊的
 echo doctor.json >> .git/info/exclude               # doctor.json 沒有被 gitignore
 ```
 
@@ -470,7 +472,7 @@ sha256sum "$OUT"/*.mp4                    # 和 output_sha256 比對（GPU 上�
 **失敗時：**
 - exit 2 或 exit 3 → 查第 8 步的對照表。
 - 這個 vendored client 的 exit code：0 成功；1 連不上伺服器或 workflow 壞了；2 執行錯誤或參數用法錯誤；3 逾時；4 送出時被 `/prompt` 拒絕。
-- 報告的判定和你親眼看到的不一致（門檻不可信）→ 先不要設 cron。用 `git checkout -- thresholds.yaml` 把它換回 repo 的出廠版 `calibrated: false`（第 1 步規則的唯一例外；簽核版還在 4d 的備份裡），runner 就會拒絕無人值守。然後擴充 Phase 0：`calibrate-batch --count N`、label、4c、4d。rollback 後在同一天（UTC 日期）重新簽核，版本號可能和備份裡那份相同；用 run.json 的 `thresholds.sha256` 分辨，或在備份資料夾名稱記下舊版本號。
+- 報告的判定和你親眼看到的不一致（門檻不可信）→ 先不要設 cron。用 `git checkout -- thresholds.yaml` 把它換回 repo 的出廠版 `calibrated: false`（第 1 步規則的唯一例外；簽核版還在 4d 的備份裡），runner 就會拒絕無人值守。然後擴充 Phase 0：`calibrate-batch --count N`、label、4c、4d。rollback 後在同一天（UTC 日期）重新簽核，版本號可能和備份裡那份相同；用 run.json 的 `thresholds.sha256` 或備份資料夾名稱裡的時間分辨。
 
 ## 6. cron 無人值守
 
@@ -545,6 +547,7 @@ cp dispatch-YYYY-MM-DD.md /data/shortsloop/dispatch/tonight.md
   - 否則 doctor 會 `FAIL vram.handoff: ComfyUI queue busy` 或 `FAIL gpu.lock`，resume 會被拒。doctor 沒有以 `ALL CHECKS PASSED` 結束就再跑，直到全綠才 resume。
 - 程序是被 kill、OOM-killer 殺掉或重開機的話，不會有 report.md，用上面同樣格式的指令手動 resume。原本加過的旗標要一起帶上；cron 跑的那一晚沒有加旗標。
 - resume 要在 01:58 之前跑完，不然當晚的 run 會因為鎖被佔用而 exit 2。
+- resume 時，`attempts.jsonl` 裡已有結果的 attempt 會照舊沿用（PASS 直接 encode，FAIL 繼續 re-roll），就算中間重新簽核了 thresholds 或換了 judge 也不會重判。
 - resume 時，attempt 已用完（預設 3 次）的片不會再試；還有額度的片（包括觸發 halt 的那支）會繼續生成。用完次數的片要重做，就放進新的派工單。
 - resume 會把之前實際跑掉的時間算進預算（report 的 Wall clock）。已經**超過** `wall_clock_budget_h` 時，resume 只會把在途和已生成的片判讀、encode 完，不會開始新的生成。還差一點才超過時，resume 仍會開始新的生成，每支最長可跑到 `comfy.timeout_s`。要補完剩下的片：把沒做完的 clip 放進新的派工單；或暫時調高 `policies.wall_clock_budget_h` → 重跑 doctor → resume → 改回來並在 01:58 前再跑一次 doctor。
 - `.venv/bin/shortsloop report $RUN` 可以用 report.json 重新產生 report.md。沒有 report.json 時會 exit 2。
@@ -581,7 +584,7 @@ kill -INT <PID>                # 等同 Ctrl-C：HALTED(interrupted)，寫出 re
 | ↳ `disk: X GB free … < 20 GB floor` | 磁碟空間不夠 | 依第 7 步「磁碟保留」清出空間 |
 | ↳ `--resume: … differs from the run's own copy` | resume 時給了不同的派工單 | 用 `<run_dir>/dispatch.md` |
 | ↳ `judge.adapter 'openai_compat' has no judge.unload_url` | judge 沒辦法卸載；通常會先看到 `last doctor run FAILED (judge.unload …)` | 在 config 加上 `unload_url`，重跑 doctor |
-| `run` exit 1 加上 Python traceback | config.yaml 結構錯誤，或 runs_dir 無法建立 | 跑 doctor，它會報 FAIL |
+| `run` exit 1 加上 Python traceback | config.yaml 結構錯誤、runs_dir 無法建立，或已簽核時開跑前查 judge build，judge 超過 20 秒沒回或回的不是 JSON（traceback 裡有 `RetryableJudgeError`） | 跑 doctor，它會報 FAIL（judge 的問題報在 `judge.model`） |
 | `run` exit 3，`HALTED(infra)` | 夜裡中途壞掉：ComfyUI 連不上（開跑時就連不上也算，run 資料夾會先建好）、ComfyUI queue 一直有別的 job 或卡住的 job 清不掉、workflow 被 ComfyUI 拒收、VRAM 沒釋放、judge 連不上或回 HTTP 錯誤、judge 的 build 在夜裡變了、連續 3 次生成失敗、連續 2 次 L2 錯誤、checker 卡住、workflow 輸出不是剛好一支影片 | 看 report.md 頂端的原因，修好後用第 7 步的方式 resume |
 | `run` exit 3，`HALTED(interrupted)` / `HALTED(crash)` | 按了 Ctrl-C（或 `kill -INT`），或 runner 發生例外 | resume |
 | exit 0，`COMPLETED(budget-stopped)` / `(disk-stopped)` | 時間預算或磁碟底線觸發，不再開始新的生成 | 報告裡被跳過的列會寫原因；有需要就調整 `pipeline.yaml`（改完重跑 doctor） |

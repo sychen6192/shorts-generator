@@ -10,12 +10,13 @@ morning report instead of a review queue.
 shortsloop-check clip.mp4 --prompt-file prompt.txt --json verdict.json
 # exit 0 PASS · 1 FAIL · 2 ERROR — the ONLY authority on clip quality
 
+# from the repo root as .venv/bin/shortsloop … (the venv is never activated)
 shortsloop doctor            # verify the workstation (writes doctor.json)
 shortsloop calibrate-batch   # Phase 0: ~40 draft clips spanning good and bad
 shortsloop label             # you label them (keyboard web UI, ~15 min)
-shortsloop calibrate-tune    # tune thresholds; --approve = human sign-off gate
+shortsloop calibrate-tune --with-l2  # score with the VLM judge + tune; --approve = human sign-off gate
 shortsloop run --dispatch d.md   # the nightly wave loop
-shortsloop report runs/<id>      # re-render a morning report
+shortsloop report <runs_dir>/<run_id>  # re-render a morning report
 ```
 
 Design in [`docs/plan.md`](docs/plan.md) (frozen contracts: verdict schema,

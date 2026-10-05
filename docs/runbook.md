@@ -10,6 +10,11 @@ step. Do not skip the gates; the runner enforces them anyway.
 Step-by-step version with pass/fail criteria per step (zh-TW):
 [`docs/workstation-checklist.md`](workstation-checklist.md).
 
+Every command a tool prints for you to run next (the resume command,
+calibrate-batch's `Next:`, calibrate-tune's `sign off with:`, refusals that say
+`run shortsloop doctor`) starts with a bare `shortsloop`: run it from the repo root
+as `.venv/bin/shortsloop …`.
+
 Paths: `<runs_dir>` is `paths.runs_dir` from config.yaml (absolute, on the big disk,
 e.g. `/big/disk/runs`); `<run_dir>` is `<runs_dir>/<run_id>`, with `run_id` = UTC
 `YYYYMMDD-HHMMSS-nightly` (`-2`, `-3`, … if taken).
@@ -22,8 +27,9 @@ encoders) on PATH — the test fixtures and the nightly QC encode need them.
 ```bash
 git clone <this repo> && cd shorts-generator
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -q          # must be green here too: 453 passed (451 + 2 skipped
-                             # without node); CPU only, ~16 min on a 4-core cloud box
+.venv/bin/pytest -q          # must be green: last line `453 passed`, or without node
+                             # `451 passed, 2 skipped` (label-UI browser tests) — both
+                             # green; CPU only, ~16 min on a 4-core cloud box
 cp config.example.yaml config.yaml
 $EDITOR config.yaml          # comfy.host (host:port, no http://; COMFY_HOST is ignored),
                              # comfy.workflow_t2v (ABSOLUTE path to your verified T2V
@@ -36,15 +42,32 @@ $EDITOR config.yaml          # comfy.host (host:port, no http://; COMFY_HOST is 
 stash, commit, `checkout --` or `reset --hard` them — backed up outside the repo with
 `calibration/` and `config.yaml` (2d). Update with `git pull --no-rebase --ff-only`
 (if it refuses, stop and hand it to the owner), then pytest and doctor; a pull that
-changes `shortsloop/l1.py` also needs 2c + 2d. docs/plan.md §6 says the signed-off
-thresholds are committed instead — that disagreement is an owner decision.
+changes `shortsloop/l1.py` also needs 2c + 2d. A pull that touches `shortsloop/l2.py`
+or `shortsloop/judge/` needs a re-score (recommended too after changing the
+judge's temperature/seed/num_ctx or `policies.judge`), which no code enforces —
+stored scores are keyed only by clip, prompt and judge model+digest, so 2c would
+reuse them: run `mv calibration/l2_scores.jsonl calibration/l2_scores.old.jsonl`,
+then 2c `--with-l2` and 2d. Sole exception to the no-`checkout --` rule: to revoke a
+sign-off you no longer trust, `git checkout -- thresholds.yaml` (back to
+`calibrated: false`; unattended runs refuse), then extend Phase 0 and re-run 2c +
+2d — the signed-off copy is in its 2d backup (a new timestamped folder per backup,
+so a later one never overwrites it). A re-sign-off on the same UTC day can reuse the
+revoked version number (YYYY-MM-DD.1): tell them apart by `thresholds.sha256` in
+run.json or by the backup folder's timestamp. `doctor.json` (§1) is not gitignored:
+run `echo doctor.json >> .git/info/exclude` once, so `git status --short` shows only
+` M pipeline.yaml` / ` M thresholds.yaml`.
+docs/plan.md §6 says the signed-off thresholds are committed instead — that
+disagreement is an owner decision.
 
 Workflow file: export your own verified workflow via ComfyUI → Workflow →
 Export (API). The `comfyui-ig-video` skill's bundled `wan22_14b_t2v_lightx2v.json`
 works as a starting template, but verify its **six** model files first — two Wan 2.2
 14B UNETs, a text encoder, a VAE and two lightx2v LoRAs, in four folders (file names:
 checklist step 0; `doctor` checks each one on the server, `models.<folder>`).
-Calibrate and run with the same workflow file; save a changed one under a new name.
+With the lightx2v LoRAs both samplers must stay at **cfg 1.0** (higher burns the
+image; doctor does not check cfg) and steps 4 (otherwise the re-roll's steps 8 is
+n/a, §5). Calibrate and run with the same workflow file; save a changed one under a
+new name.
 
 Judge model: `ollama pull qwen3-vl:8b-instruct` (or the closest 8B-class VL
 build available). Rewrite model (the one logged off_prompt rewrite, on by default):
@@ -80,8 +103,7 @@ Verifies, in this order:
 
 - **pipeline.yaml** loaded exactly as the runner loads it; a file the runner
   would refuse (e.g. `policies.judge` not a mapping) is a FAIL, a missing one a WARN
-  (defaults apply). Every judge and VRAM check below uses these values — the
-  nightly's, not config.yaml's.
+  (defaults apply). Every judge and VRAM check below uses these values.
 - **ffmpeg/ffprobe** — absolute paths are recorded in `doctor.json` (`tools`).
   Cron does not inherit your shell's PATH: doctor prints the `PATH=…` line the
   crontab needs (§4) and warns when the binaries live outside cron's default
@@ -103,16 +125,13 @@ Verifies, in this order:
 - **VRAM handoff**: `/free`, then free VRAM verified via `/system_stats`. Only then
   does the judge VLM load — hard rule 3 applies to the doctor's own probes too.
 - **Judge**: configured exactly as the nightly checker gets it (config.yaml's
-  `judge` section with `pipeline.yaml` `policies.judge.timeout_s` / `retries`).
+  `judge` section with the nightly's timeout/retries, §0).
   Reachable, model installed, a **two-call color vision probe** (catches a judge
   that cannot actually see), then an **L2 dry run** — the real nightly call: 8
   frames of a synthetic 720x1280 clip + the rubric + the strict response schema,
-  answered within `pipeline.yaml` `policies.judge.timeout_s` (proves the context —
-  `judge.num_ctx` on Ollama, the server's own setting on `openai_compat` — fits 8
-  images and the model build handles them; WARN if it took over half the
-  timeout — raise it in `pipeline.yaml`, not `config.yaml`). Both probes parse
-  replies with the nightly L2 parser: a JSON object, optionally wrapped in one
-  `<think>…</think>` block and one ```` ``` ```` fence — nothing else.
+  answered within that timeout (proves the context — `judge.num_ctx` on Ollama,
+  the server's own setting on `openai_compat` — fits 8 images and the model build
+  handles them; `WARN judge.latency` if over half the timeout — raise it there).
 - **Judge unload** — the nightly's own judge→generation handoff, proven able to
   catch a resident judge:
   - `openai_compat` without `judge.unload_url` FAILs at once; its probes are not
@@ -127,7 +146,11 @@ Verifies, in this order:
     24 GB free on a 32 GB card). The detail and `doctor.json` (`vram`) show both
     readings and suggest a `gen_free_min_gb` between them — set that midpoint
     (not a value near the unloaded reading) under `policies.vram_handoff` in
-    `pipeline.yaml` (a local change, §0) and re-run doctor.
+    `pipeline.yaml` (a local change, §0) and re-run doctor. Doctor suggests one
+    only when the unload freed at least 1 GB; otherwise the detail says `the
+    unload freed too little VRAM … fix the judge unload first` — no threshold can
+    work: check `ollama ps` / `nvidia-smi` (judge unload, other resident models)
+    and re-run doctor.
   - No judge reply at all = the loaded reading proves nothing = FAIL.
 - **Rewrite model** on the server the rewrite actually calls (`rewrite.base_url`,
   else the judge's Ollama, else local Ollama) — warning only.
@@ -135,17 +158,20 @@ Verifies, in this order:
   **thresholds** state (`calibrated: false` is only a WARN here; `run` refuses it
   separately).
 
-Writes `doctor.json` next to `config.yaml`. The file is overwritten with
-`ok: false` (`status: "in progress"`) the moment doctor starts; only a run that
-completes with no FAIL writes `ok: true` (`ALL CHECKS PASSED`, exit 0; else exit 2).
+Writes `doctor.json` next to `config.yaml` (not gitignored — exclude it once, §0).
+It is overwritten with `ok: false` (`status: "in progress"`) the moment doctor
+starts; only a run that completes with no FAIL writes `ok: true` (`ALL CHECKS
+PASSED`, exit 0; else exit 2) — a crash or Ctrl-C leaves the `ok: false` placeholder.
 WARNs (`comfy.queue`, `cron.path`, `rewrite.model`, `judge.latency`, `thresholds`
-before sign-off) do not block `ok: true` — read them anyway. A crash or Ctrl-C leaves
-`ok: false` — never an older green snapshot. **The nightly runner refuses to start
-without a passing snapshot** (`--skip-doctor` exists for supervised debugging only)
-or with a stale one: it fingerprints the exact bytes of `config.yaml`,
-`pipeline.yaml` and the workflow JSON, plus `comfy.host` and `judge.adapter`/`model`
-— after any change (a comment counts) re-run doctor. `thresholds.yaml` is not
-fingerprinted: sign-off (2d) needs no re-run. A daytime diagnosis that must not touch
+before sign-off) do not block `ok: true` — read them anyway. A busy queue is only a
+WARN itself, but if it does not drain within `vram_handoff.wait_timeout_s` (180 s)
+the handoff FAILs (`vram.handoff: ComfyUI queue busy`): run doctor with an empty
+queue. **The nightly runner refuses to start without a passing snapshot**
+(`--skip-doctor` exists for supervised debugging only) or with a stale one: it
+fingerprints the exact bytes of `config.yaml`, `pipeline.yaml` and the workflow
+JSON, plus `comfy.host` and `judge.adapter`/`model` — after any change (a comment
+counts) re-run doctor. `thresholds.yaml` is not fingerprinted: sign-off (2d) needs
+no re-run. A daytime diagnosis that must not touch
 the snapshot: `.venv/bin/shortsloop doctor --out /tmp/doctor-diag.json`.
 
 Anything doctor *could not verify* that the nightly depends on is a FAIL, not a
@@ -157,15 +183,13 @@ Wan). Run plain `.venv/bin/shortsloop doctor` before any unattended night.
 ## 2. Phase 0 — calibration (one afternoon, two hard gates)
 
 Calibration does not check `doctor.json`: get §1 green first. The GPU steps (2a,
-and 2c's judge wave) take the nightly runner's lock, `<runs_dir>/.shortsloop.lock`:
-while a `shortsloop run` holds it they refuse with exit 2 (and vice versa) — one GPU
-user at a time. The lock path always comes from `paths.runs_dir` in config.yaml
-(default `runs`, relative to the working directory); `run --runs-dir` moves only the
-run folders, never the lock. So set `paths.runs_dir` to an absolute path: a relative
-one resolved from different working directories (cron vs. your shell) gives each
-process its own lock file, and the lock protects nothing. Both steps read
-pipeline.yaml the same way the runner does; a malformed `policies:` block is a
-refusal (exit 2).
+and 2c's judge wave) take the nightly runner's lock (§4): while a `shortsloop run`
+holds it they refuse with exit 2, and vice versa. Both steps read pipeline.yaml the
+same way the runner does; a malformed `policies:` block is a refusal (exit 2). Run
+2a, 2c and supervised `run`s (§3) inside tmux/screen: nothing handles SIGHUP, so an
+SSH disconnect kills them like SIGTERM — no report, and 2a's in-flight ComfyUI job
+is left queued (2a cannot re-attach it: stop it with `comfy_client.py interrupt`, §4,
+before re-running).
 
 ```bash
 # 2a. ~40 draft-res clips (480x832, 81 frames), deliberately spanning good and bad
@@ -200,35 +224,50 @@ refusal (exit 2).
 .venv/bin/shortsloop calibrate-tune --with-l2
 #     The judge scores clips exactly as the nightly checker will: config.yaml's
 #     judge with pipeline.yaml's judge timeout_s/retries. Exit 2, nothing judged:
-#     no manifest, unusable judge config or pipeline.yaml, a judge it could not
-#     unload (`openai_compat` without `judge.unload_url`), no comfy.host, or
-#     another process holds the run lock. Judging starts only after ComfyUI is
-#     /free'd and free VRAM is verified; the judge is unloaded afterwards. Exit 3
-#     (INFRA): judge unreachable / model not pulled, the VRAM handoff failed, or
-#     the judge died mid-wave (scored clips are kept — re-run to continue).
+#     no manifest, no `judge:` section (or config.yaml missing/unparseable), an
+#     unusable pipeline.yaml, a judge it could not unload (`judge.adapter '<x>'
+#     has no judge.unload_url`: `openai_compat` without it — or a misspelled
+#     adapter, anything but ollama | openai_compat: fix the spelling, do not add
+#     an unload_url; doctor's `judge.model` says `unknown judge adapter`), no
+#     comfy.host, or another process holds the run lock. Judging starts only
+#     after ComfyUI is /free'd and free VRAM is verified; the judge is unloaded
+#     afterwards. Exit 3 (INFRA): a judge section missing base_url/model
+#     (`INFRA: judge config needs base_url and model` — fix config.yaml, then
+#     re-run doctor) or a misspelled adapter that does have an unload_url
+#     (`unknown judge adapter`), judge unreachable / model not pulled, the VRAM
+#     handoff failed, or the judge died mid-wave (scored clips are kept — re-run
+#     to continue).
 #     Scores are keyed by clip+prompt sha and judge model+digest; a clip the
 #     judge cannot evaluate is recorded (a runtime ERROR) and skipped on re-run —
 #     to re-score after fixing the judge, move calibration/l2_scores.jsonl aside.
 #     Tuning refuses (exit 2, writes NO proposal) with < 10 usable labels, all-pass
 #     or all-fail labels, a held-out split missing a pass or a fail, or partial
 #     judge coverage. Labels whose clip bytes changed since labeling are
-#     excluded and listed.
+#     excluded and listed. To label more: `calibrate-batch --count 56` (or more —
+#     the first 40 rows are identical and skipped; only cal041+ are generated),
+#     `label` (press n past clips already labeled), then 2c `--with-l2` again (it
+#     scores only the new clips) and 2d.
 #     read calibration/tuning_report.md: TEST agreement, FALSE-PASS = labeled-
 #     fail clips that would ship / all labeled-fail clips (+Wilson CI),
 #     false-fail, per-class confusion, per-layer catch attribution (L1 vs L2,
 #     and what each would catch alone; clips the judge could not evaluate are
 #     counted in their own "L2 ERROR" columns, never as L2 catches) — for the
 #     combined L1+L2 decision. stdout must say `TEST (L1+L2)`, not `L1 only`.
-#     ⚠️ "L2 FLOORS ARE A FALLBACK" (report top, stdout, and
-#     provenance.l2_floors_fallback): the judge fails more labeled-pass clips
-#     than the 20% false-fail cap under EVERY floor (a dimension scored 1, or all
-#     N/A) — the clips are listed. The floors are then the least-bad combination
+#     ⚠️ Fallback floors — the report says `⚠️ **L2 FLOORS ARE A FALLBACK — …`,
+#     stdout `[calibrate-tune] WARNING: L2 floors are a FALLBACK, not a fit — …`,
+#     and provenance.l2_floors_fallback is non-null (`grep -i fallback`): the
+#     judge fails more labeled-pass clips than the 20% false-fail cap under EVERY
+#     floor (a dimension scored 1, or all N/A) — the clips are listed. The floors are then the least-bad combination
 #     (no false-fail beyond those clips), not a fit. The judge disagrees with
 #     your labels: re-check those clips, or escalate as below.
 #     If the 8B judge disagrees with your labels too often, pull a ~32B VL
 #     model, update config.yaml, re-run doctor (config changed), and re-run this
 #     step: every clip is re-scored by the new judge and only its scores are
-#     used; provenance names it.
+#     used; provenance names it. Measure the new judge's resident VRAM during the
+#     wave (`ollama ps` / `nvidia-smi`): `vram_handoff.free_min_gb` — the only
+#     check before the judge loads — must be at least that and at most the card.
+#     Make every pipeline.yaml change at once, then re-run doctor after the last
+#     edit and re-check judge.unload's two readings (gen_free_min_gb).
 #     Without --with-l2 nothing is re-scored: the stored scores of config.yaml's
 #     judge model are reused (any build; the latest digest written wins). Only
 #     with none is the proposal L1-ONLY (untuned default L2 floors — see 2d).
@@ -250,16 +289,17 @@ refusal (exit 2).
 #     uncalibrated instrument). It warns (and the marker stays in provenance)
 #     when the L2 floors are a fallback (2c).
 #     The value check is approve-time only: `run` would not notice a later hand
-#     edit of thresholds.yaml — never edit it; re-run 2c + 2d (each approve writes
-#     the next version). The sign-off is tied to the judge build AND the bytes of
-#     shortsloop/l1.py: `run` refuses after a pull that changes l1.py, until
-#     2c + 2d are re-run. No doctor re-run needed.
+#     edit of thresholds.yaml — never edit it; re-run 2c + 2d.
 #     Keep thresholds.yaml as an uncommitted local change (§0) and back up what a
-#     re-tune needs outside the repo (restore only to the same absolute path):
-B=/big/disk/backup/$(date +%F); mkdir -p "$B" && cp -a calibration config.yaml thresholds.yaml pipeline.yaml "$B"/
+#     re-tune needs outside the repo, in a NEW folder each time (a date-only name
+#     is overwritten by a same-day re-sign-off; restore only to the same absolute
+#     path):
+B=/big/disk/backup/$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$B" && cp -a calibration config.yaml thresholds.yaml pipeline.yaml "$B"/
 #
-#     Supervised exception, not the normal path — sign off an L1-only proposal:
-.venv/bin/shortsloop calibrate-tune --approve --accept-untested-l2
+#     Supervised exception, not the normal path — an ALTERNATIVE to --approve
+#     (never a follow-up: a second approve bumps the version), to sign off an
+#     L1-only proposal. Deliberately commented out:
+# .venv/bin/shortsloop calibrate-tune --approve --accept-untested-l2
 #     Writes untuned default L2 floors with L1-only test numbers and a loud
 #     marker: provenance.test_scope stays "L1 only — …" and approve records
 #     provenance.l2_untested_accepted: true. The runner enforces it: such
@@ -268,8 +308,6 @@ B=/big/disk/backup/$(date +%F); mkdir -p "$B" && cp -a calibration config.yaml t
 #     encoded_uncalibrated/, never encoded/. Replace it with a judge-backed
 #     sign-off (2c + 2d) before any unattended night.
 ```
-
-Until 2d, `shortsloop run` refuses to start without `--allow-uncalibrated`.
 
 ## 3. First supervised run
 
@@ -280,10 +318,10 @@ for the first night; intake rules and a CPU-only pre-check: checklist step 5), t
 .venv/bin/shortsloop run --dispatch /path/to/dispatch-YYYY-MM-DD.md
 ```
 
-Before Phase 0 is signed off you can rehearse with `--allow-uncalibrated`: PASS
-clips then land in `encoded_uncalibrated/` (never `encoded/`) and the report
-carries an UNCALIBRATED banner — a rehearsal, not a night's output. After sign-off
-the flag changes nothing (PASS clips go to `encoded/`); never put it, or
+Until 2d, `run` refuses to start without `--allow-uncalibrated`; with it you can
+rehearse: PASS clips then land in `encoded_uncalibrated/` (never `encoded/`) and the
+report carries an UNCALIBRATED banner — a rehearsal, not a night's output. After
+sign-off the flag changes nothing (PASS clips go to `encoded/`); never put it, or
 `--skip-doctor`, in the crontab.
 
 Watch the first one. Read `<run_dir>/report.md` (the runner's last stdout line,
@@ -291,11 +329,11 @@ Watch the first one. Read `<run_dir>/report.md` (the runner's last stdout line,
 definition of done: per-clip verdicts + reasons, silent QC MP4s of passing clips
 only, full `attempts.jsonl`, budget/cap evidence. Reproduce one clip from its
 `attempts.jsonl` line to close the loop — from the repo root, while nothing holds
-the GPU (no shortsloop process, `ollama ps` empty: the vendored client takes no lock
-and does no VRAM handoff):
+the GPU (the lock is free and the queue empty — check as in §4 — and `ollama ps`
+empty: the vendored client takes no lock and does no VRAM handoff):
 
 ```bash
-COMFY_HOST=<config comfy.host> python3 shortsloop/vendor/comfy_client.py run \
+COMFY_HOST=<run.json comfy.host> python3 shortsloop/vendor/comfy_client.py run \
   -w <workflow_path> --prompt "$(cat <run_dir>/prompts/<clip_id>_a<n>.txt)" \
   --seed <seed> --width <w> --height <h> --length <length> --fps <fps> \
   [--steps <steps>] --out /tmp/repro-<n>        # a fresh, empty directory
@@ -304,10 +342,11 @@ sha256sum <workflow_path> /tmp/repro-<n>/*.mp4  # vs workflow_sha256 / output_sh
 Seed, size, length, fps and `steps` (present only when a re-roll set it — pass
 `--steps` only then) come from `patch_args`; the prompt file holds the attempt's
 `prompt_text`; `workflow_path` must still match `workflow_sha256`; the host is not
-logged (config.yaml `comfy.host`). Omitting `--seed` means random; omitting `--out`
-writes to `./outputs`. Client exit codes: 0 ok · 1 server unreachable or workflow
-unreadable/not API format · 2 execution or usage error · 3 timeout · 4 submit
-rejected. Bit-identical GPU output is UNVERIFIED-ON-GPU: record the result.
+in `attempts.jsonl` — take it from `<run_dir>/run.json` → `comfy.host`. Omitting
+`--seed` means random; omitting `--out` writes to `./outputs`. Client exit codes:
+0 ok · 1 server unreachable or workflow unreadable/not API format · 2 execution or
+usage error · 3 timeout · 4 submit rejected. Bit-identical GPU output is
+UNVERIFIED-ON-GPU: record the result.
 
 ## 4. Unattended nightly
 
@@ -330,9 +369,12 @@ calibration, doctor or supervised run may still hold the GPU.
 
 One GPU user per `paths.runs_dir`: a second `run` (or an overlapping
 `--resume`) refuses with exit 2 while the first holds `<runs_dir>/.shortsloop.lock`
-(e.g. `/big/disk/runs/.shortsloop.lock`, whatever `--runs-dir` says); the same lock
-is taken by `calibrate-batch`, `calibrate-tune --with-l2` and doctor's GPU checks,
-so they can never share the card with a night. It is a `flock`, released when the
+(e.g. `/big/disk/runs/.shortsloop.lock`, whatever `--runs-dir` says — the lock path
+always comes from config.yaml's `paths.runs_dir`, so keep that absolute: a relative
+one resolved from different working directories, cron vs. your shell, gives each
+process its own lock file); the same lock is taken by `calibrate-batch`,
+`calibrate-tune --with-l2` and doctor's GPU checks, so they can never share the card
+with a night. It is a `flock`, released when the
 holder exits (even if killed); never delete the file (a second process would lock a
 fresh one beside it). **Do not run doctor while a night or calibration holds the
 lock**: the job is unaffected, but doctor records `FAIL gpu.lock` and rewrites
@@ -364,30 +406,49 @@ bare `shortsloop`; run it from the repo root as `.venv/bin/shortsloop …`, e.g.
   --config config.yaml --pipeline pipeline.yaml --thresholds thresholds.yaml
 ```
 
-A run killed outright (SIGTERM, `kill -9`, OOM-killer, reboot) writes no report:
-resume its `<run_dir>` by hand the same way, with the original flags (a cron night
-has none). To stop a run cleanly use SIGINT (Ctrl-C or `kill -INT <pid>` →
-`HALTED(interrupted)` with a report), never plain `kill`; the in-flight ComfyUI job
-keeps running and resume re-attaches it. If the fix touched config.yaml,
-pipeline.yaml or the workflow, re-run doctor (with an empty ComfyUI queue and the lock
-free) first, and finish before 01:58 or that night refuses on the lock. On resume,
-finished verdicts are reused (cache keyed by clip, prompt, thresholds and judge
-digest), in-flight ComfyUI jobs are re-attached before anything new is submitted,
+A run killed outright (SIGTERM, `kill -9`, OOM-killer, reboot, SSH hang-up) writes no
+report: resume its `<run_dir>` by hand the same way, with the original flags (a cron
+night has none). To stop a run cleanly use SIGINT → `HALTED(interrupted)` with a
+report; never plain `kill`. Ctrl-C, or `pgrep -af 'shortsloop run'` and then
+`kill -INT <PID>` with the PID of the `…/.venv/bin/python3 .venv/bin/shortsloop run …`
+line — not cron's `/bin/sh -c` wrapper: a signal sent to the wrapper never reaches
+the run (the shell holds it until the run ends on its own), so the night keeps going.
+The in-flight ComfyUI job keeps running and resume re-attaches it — if you will
+resume, do not interrupt it. Not resuming (an abandoned rehearsal or sheet)? Stop it
+from the repo root with `COMFY_HOST=<comfy.host> python3
+shortsloop/vendor/comfy_client.py interrupt`, then check the queue as below. If the fix
+touched config.yaml, pipeline.yaml or the workflow, re-run doctor first, and finish
+before 01:58 or that night refuses on the lock. Check before that doctor:
+`flock -n <runs_dir>/.shortsloop.lock true && echo lock-free` prints `lock-free`, and
+`COMFY_HOST=<comfy.host> python3 shortsloop/vendor/comfy_client.py queue` prints
+`queue empty` (else `FAIL gpu.lock` / `FAIL vram.handoff`). On resume, attempts
+already recorded in `attempts.jsonl` keep their outcome (a PASS is encoded, a FAIL
+re-rolls) even if thresholds.yaml or the judge changed since — re-signing before a
+resume does not re-judge them; a verdict written just before the stop but missing
+from `attempts.jsonl` is reused only if clip, prompt, thresholds sha and judge digest
+all match. In-flight ComfyUI jobs are re-attached before anything new is submitted,
 generated-but-unjudged clips go straight to the judge, and the wall-clock budget
 keeps counting from the time already spent. A different sheet is refused.
+
+Disk retention: nothing is pruned — `clips/`, `encoded/` and `sheets/` accumulate
+until the 20 GB floor refuses a night or stops it `COMPLETED(disk-stopped)`. Delete
+only runs you will not `--resume`; after upload, old runs' `clips/` and `encoded/`
+may go; keep `attempts.jsonl`, `events.jsonl`, `prompts/`, `run.json` and
+`report.*` (small, needed to reproduce). Clean ComfyUI's own output folder
+separately: the floor only watches `paths.runs_dir`.
 
 ## 5. Exit codes & failure playbook
 
 | Symptom | Meaning / fix |
 |---|---|
-| `run` exits 2 before generating (`REFUSING TO RUN: …`) | Refusal, reason after the colon: config missing or lacking `comfy.host` / `comfy.workflow_t2v` / `judge.model` / doctor snapshot missing, failed (incl. an interrupted doctor or `FAIL gpu.lock`) or stale (`changed since doctor: …` — re-run doctor) / thresholds off-shape or uncalibrated (incl. `--accept-untested-l2`) / L1 code or judge mismatch (rows below) / `openai_compat` without `judge.unload_url` / dispatch intake (per-row errors listed; also a missing sheet) / workflow knobs not patchable / ffmpeg or ffprobe not on PATH / disk below floor / another process holds the lock / `--resume` dir missing or a different sheet. Nothing was burned. |
-| `run` exits 1 with a Python traceback | Not a refusal: config.yaml has the wrong shape (top level, `comfy:` or `judge:` not a mapping) or `runs_dir` cannot be created. Run doctor — it reports these as FAIL. |
-| `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: ComfyUI unreachable (even at start — the run dir already exists), submit rejected, queue busy or a stuck job that won't clear, a job saving other than one video; VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts); judge down or its build changed; 3 consecutive generation failures; `policies.judge.infra_escalation_after` (default 2) consecutive clip-scope judge errors; checker hung or contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix, then resume (§4). |
+| `run` exits 2 before generating (`REFUSING TO RUN: …`) | Refusal, reason after the colon: config missing or lacking `comfy.host` / `comfy.workflow_t2v` / `judge.model` / doctor snapshot missing, failed (incl. an interrupted doctor or `FAIL gpu.lock`) or stale (`changed since doctor: …` — re-run doctor) / thresholds off-shape or uncalibrated (incl. `--accept-untested-l2`) / L1 code or judge mismatch (rows below) / `judge.adapter '<x>' has no judge.unload_url` (`openai_compat` without it, or a misspelled adapter: fix the spelling) / dispatch intake (per-row errors listed; also a missing sheet) / workflow knobs not patchable / ffmpeg or ffprobe not on PATH / disk below floor / another process holds the lock / `--resume` dir missing or a different sheet. Nothing was burned. |
+| `run` exits 1 with a Python traceback | Not a refusal: config.yaml has the wrong shape (top level, `comfy:` or `judge:` not a mapping) or `runs_dir` cannot be created; or, with signed-off thresholds, the judge hung (>20 s) or returned non-JSON at the start-up build check (`RetryableJudgeError` in the traceback — check Ollama / llama-swap). Run doctor — it reports these as FAIL (`judge.model` for the judge). |
+| `run` exits 3, report says HALTED(infra) | Instrument broke mid-run: ComfyUI unreachable (even at start — the run dir already exists), submit rejected, queue busy or a stuck job that won't clear, a job saving other than one video; VRAM not freed in either direction (a VLM/LLM still resident before a Wan wave counts); judge down or its build changed; 3 consecutive generation failures; `policies.judge.infra_escalation_after` (default 2) consecutive clip-scope judge errors; checker hung or contract violated. Nothing was generated or judged after the halt; clips that passed before it were still encoded. Fix (judge errors: L2 ERROR row below), then resume (§4). |
 | `run` exits 3, report says HALTED(interrupted) / HALTED(crash) | Ctrl-C / `kill -INT`, or a runner exception (traceback on stderr). Same clean halt and resume command — resume (§4). |
-| cron.log has no `[shortsloop] …` last line and there is no report.md | Killed outright (SIGTERM/SIGKILL, OOM-killer, reboot) — resume by hand (§4) — or cron never fired (`grep CRON /var/log/syslog`: a split entry, an unescaped `%`). |
+| cron.log has no final `[shortsloop] <STATUS>: n/m clips passed · report: …` line for that night (and no `REFUSING TO RUN`), and there is no report.md | Killed outright (SIGTERM/SIGKILL, OOM-killer, reboot) — resume by hand (§4) — or cron never fired (`grep CRON /var/log/syslog`, or `journalctl -u cron` where there is no syslog file: a split entry, an unescaped `%`). |
 | Report status `COMPLETED(budget-stopped)` / `COMPLETED(disk-stopped)` (exit 0) | A budget tripped: no new generation after it; everything already generated was judged, encoded and reported (`skipped` rows say which budget). |
 | `run` exits 0 with failures in report | Working as designed: failures were caught, bounded, explained. Pass rate is a tuning metric, not an acceptance criterion. |
-| Every clip ERRORs at L2 | `doctor` → vision probe + 8-frame L2 dry run. Ollama vision broken ⇒ switch to `openai_compat` + llama.cpp behind llama-swap, and set `judge.unload_url` (llama-swap's `/unload`) — without one, `run`, `calibrate-batch` and `calibrate-tune --with-l2` refuse at start and doctor FAILs, because the VLM could not be evicted before a Wan wave (hard rule 3). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
+| HALTED(infra): `N consecutive clip-scope judge errors`, or clips ERROR at L2 | `doctor` → vision probe + 8-frame L2 dry run; timeouts → raise `policies.judge.timeout_s` (`judge.latency`), re-run doctor. Ollama vision broken ⇒ switch adapters as in §0 (`openai_compat` behind llama-swap, with `judge.unload_url`). When the judge answered but the reply was unusable, its raw text is kept next to the ERROR verdict (`*.l2_raw.json`); timeouts and an unreachable judge leave none. |
 | OOM during generation | Runner already `/free`s and re-rolls, but each OOM uses one of the clip's attempts and 3 consecutive generation failures halt the night. If chronic, lower the sheet's 共用參數: `解析度` 480x832 and/or a shorter 4n+1 length (e.g. 49 frames; 81 is already the default, and a non-4n+1 length fails intake). |
 | Report shows `encode failed after PASS` | Clip passed QC but the encode failed verification (size/fps/codec/aac/silence) or the clip bytes no longer match the verdict — nothing was left in `encoded/`; the raw file is kept in `<run_dir>/clips/`. |
 | `run` refuses (exit 2): thresholds calibrated with another judge, `judge build … differs`, or `cannot identify the judge build` | L2 floors are tuned to one judge model and build (`thresholds.yaml` provenance.judge), checked at start before anything is created — an `ollama pull` that changes the digest blocks the next night. Re-pull that build (or start Ollama), or re-run Phase 0 for the new judge (`calibrate-tune --with-l2`, then `--approve`). |
@@ -397,27 +458,38 @@ keeps counting from the time already spent. A different sheet is refused.
 
 ## 6. What is still UNVERIFIED-ON-GPU (first-night checklist)
 
+Complete list with pass criteria (also: both Ollama tags pulled, timing within
+budget): checklist step 9.
+
 - [ ] `doctor` fully green on the workstation (`judge.vision`, `judge.l2_dryrun`,
       `judge.unload` all OK)
 - [ ] `calibrate-batch` produces 40 playable draft clips (spot-check 2-3 with
       ffprobe: 480x832, 81 frames)
-- [ ] judge wave actually fits in VRAM after `/free` (watch `nvidia-smi` once), and
-      the judge->generation handoff sees the VLM gone: on a night with a 2nd wave,
-      each `judge_unload` event in `<run_dir>/events.jsonl` (but the last) is
-      followed by a `"stage": "generate"` `vram_handoff` event with the measured
-      free VRAM, and no halt. That event is written only after the check passed,
-      so also confirm `ollama ps` is empty during wave 2's generation
+- [ ] judge wave fits in VRAM after `/free` (watch `nvidia-smi` once); on a night
+      with a 2nd wave, `ollama ps` is empty and `nvidia-smi` shows no judge during
+      wave 2's generation, and the night did not halt (the runner logs
+      `"layer": "vram_handoff"` in events.jsonl only after its check passed; a
+      failed check halts HALTED(infra))
 - [ ] handoff thresholds suit the card: `vram_handoff.free_min_gb` (24) must leave
-      the judge room; set `vram_handoff.gen_free_min_gb` (doctor prints both
-      readings and a recommended value) so an idle card clears it but
-      one with the VLM still loaded (`ollama ps`) does not — otherwise the
-      judge->generation check cannot tell them apart
-- [ ] real Wan clip L1 metrics look sane vs fixtures: `l1.metrics` in
-      `<run_dir>/verdicts/<clip_id>_a1.l1.json` (the runner writes one per attempt).
+      the judge room; `doctor.json` → `judge.unload` `vram` shows loaded <
+      `gen_free_min_gb` <= unloaded. Only if `judge.unload` FAILed, set
+      `gen_free_min_gb` to the midpoint doctor suggests (§1) and re-run doctor
+- [ ] real Wan clip L1 metrics are plausible: in
+      `<run_dir>/verdicts/<clip_id>_a1.l1.json` (the runner writes one per attempt)
+      read `l1.checks` (each rule's `value` against the signed-off `threshold`, and
+      `pass`) for one clip you would label pass and one you would label fail;
+      `l1.metrics` holds the raw numbers. The test fixtures are synthetic 480x832
+      48-frame patterns, not a reference for real clips.
       By hand, from the repo root: `.venv/bin/shortsloop check <run_dir>/clips/<clip_id>_a1.mp4
       --prompt-file <run_dir>/prompts/<clip_id>_a1.txt --l1-only --json /tmp/l1.json`
       (`--prompt-file` is required; stdout is only the `VERDICT` line — PROCEED,
       never PASS — so read the metrics in the JSON)
+- [ ] each job saves exactly one video whose spec matches the sheet (the supervised
+      run, §3)
+- [ ] a flicker re-roll and a static clip's 3rd attempt really run with
+      `"steps": 8` in their `patch_args` (attempts.jsonl) and generate a usable clip
+      (static's 2nd attempt adds only the motion phrase)
+- [ ] `encoded/*.mp4` probes as h264 1080x1920 30/1 + aac (silent)
 - [ ] reproduce one clip (§3) and record whether its sha256 matches `output_sha256`
 - [ ] E2E: one real ~6-clip dispatch sheet unattended from cron (minimal PATH) →
       `cron.log` line → morning report (DoD)
