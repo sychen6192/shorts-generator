@@ -1,6 +1,6 @@
 # shortsloop 工作站（`llm`）操作清單：從 clone 到每晚 cron 自動跑
 
-依據是 repo HEAD `6c1f080` 的程式碼（tree 和 `origin/main` 的 `219059f` 相同），加上在雲端 CPU 上實際跑過的指令。docs/runbook.md（以及 docs/plan.md 的一處）跟這份不一致的地方以這份為準，差異列在文末。凡是碰到 GPU 的行為，在你於工作站跑過之前都算 **UNVERIFIED-ON-GPU**。
+依據是 repo 的程式碼，加上在雲端 CPU 上實際跑過的指令。英文的詳細說明在 docs/runbook.md（已和程式碼對齊）；docs/plan.md 有一處和這份不同，列在文末。凡是碰到 GPU 的行為，在你於工作站跑過之前都算 **UNVERIFIED-ON-GPU**。
 
 **共通規則**
 - 所有指令都**在 repo 根目錄**下執行，一律用 `.venv/bin/shortsloop`。`config.yaml`、`pipeline.yaml`、`thresholds.yaml`、`calibration/` 這些預設路徑都是相對於目前所在目錄。
@@ -13,7 +13,7 @@
 | # | 步驟 | 大約時間 | 閘門 |
 |---|---|---|---|
 | 0 | 事前準備（驅動、ComfyUI、模型、Ollama、ffmpeg、磁碟） | 看要下載多少模型 | |
-| 1 | clone、建 venv、跑 pytest（452 個測試） | 10–20 分鐘（工作站上還沒量過） | |
+| 1 | clone、建 venv、跑 pytest（453 個測試） | 10–20 分鐘（工作站上還沒量過） | |
 | 2 | 設定 `config.yaml` 和 `pipeline.yaml` | 10 分鐘 | |
 | 3 | `doctor`（可能要跑兩次） | 每次幾分鐘（還沒量過） | doctor FAIL `judge.unload` 時，由你決定 `gen_free_min_gb` |
 | 3b | （選做）彩排：做第 5 步的 (a)(b)(c)，做完再回 4a | 同第 5 步 | 看著跑 |
@@ -138,7 +138,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 - pull 成功後依重跑表處理（動到 `shortsloop/` → 1 pytest、3 doctor；動到 `l1.py` 再加 4c 和 4d）。
 
 **通過條件：**
-- [ ] pytest 最後一行是 `452 passed`；工作站沒裝 `node` 時是 `450 passed, 2 skipped`（跳過的是標註 UI 的瀏覽器邏輯測試），同樣算通過。README 寫的「~300」已經過時。雲端 4 核在有負載時跑了 16 分鐘，工作站上的時間還沒量過。4d 之後如果出現 1 個 `test_repo_placeholder_thresholds_fail_strobes_on_flicker` 失敗，見 4d「注意」。
+- [ ] pytest 最後一行是 `453 passed`；工作站沒裝 `node` 時是 `451 passed, 2 skipped`（跳過的是標註 UI 的瀏覽器邏輯測試），同樣算通過。4d 簽核、改了 `pipeline.yaml` 之後也必須全綠。雲端 4 核跑了約 16 分鐘，工作站上的時間還沒量過。
 - [ ] `.venv/bin/shortsloop --help` 列出 7 個子指令（`check run report label calibrate-batch calibrate-tune doctor`），exit 0。
 
 **失敗時：**
@@ -395,7 +395,6 @@ $EDITOR config.yaml                               # 改 judge.model
 git diff --stat thresholds.yaml
 B=/data/shortsloop/backup/$(date +%F); mkdir -p "$B" && cp -a calibration config.yaml thresholds.yaml pipeline.yaml "$B"/   # 備份
 echo doctor.json >> .git/info/exclude               # doctor.json 沒有被 gitignore
-.venv/bin/python -c "import yaml; print(yaml.safe_load(open('thresholds.yaml'))['l1']['flicker']['value'])"   # 簽核後的 flicker 門檻
 ```
 
 **通過條件：**
@@ -414,7 +413,7 @@ echo doctor.json >> .git/info/exclude               # doctor.json 沒有被 giti
 **注意：**
 - 不要重複 approve。每次 approve 的版本號都比 thresholds.yaml 目前的版本高一號，verdict 快取的 key（thresholds 檔的 sha256）也會跟著變。
 - `calibration/`、`config.yaml` 是 gitignore 的，`thresholds.yaml`、`pipeline.yaml` 依第 1 步的規則不 commit，所以上面的備份是 repo 外唯一的副本；之後任何重調都需要同一份 `calibration/`，而且只能還原到**同一個絕對路徑**的 checkout（見第 1 步「重新 clone」）。
-- approve 會把 thresholds.yaml 改寫成區塊格式（`flicker:` 的 `value:` 在另一行），所以用上面的 python 指令讀值，不要 grep。值 ≥ 15 時 `tests/test_l1.py::test_repo_placeholder_thresholds_fail_strobes_on_flicker` 會變紅（它讀 repo 的 `thresholds.yaml`，假設的是出廠值 2；合成 fixture 裡最小的 strobe_burst 是 15）。這不代表安裝壞掉；怎麼處理由 owner 決定。
+- approve 會把 thresholds.yaml 改寫成區塊格式（`flicker:` 的 `value:` 在另一行），要看某個門檻請用 `.venv/bin/python -c "import yaml; print(yaml.safe_load(open('thresholds.yaml'))['l1']['flicker'])"`，不要 grep。
 - 不建議的監督用例外：`.venv/bin/shortsloop calibrate-tune --approve --accept-untested-l2`。效果見「需要你決定的事」第 3 點；這樣簽完 cron 不能用。
 
 ## 5. 第一次在旁邊看著跑
@@ -612,15 +611,6 @@ kill -INT <PID>                # 等同 Ctrl-C：HALTED(interrupted)，寫出 re
 
 ---
 
-## 跟 docs/runbook.md、docs/plan.md 不一致的地方（以這份為準）
+## 跟 docs/plan.md 不一致的地方（以這份為準）
 
-- runbook §4 crontab 被拆成兩行並用 `\` 接續 → 必須寫成**一行**。
-- runbook §4 寫鎖在 `runs/.shortsloop.lock`；§2 說 `--runs-dir` 會讓 run 拿到不同的鎖 → 實際上鎖永遠在 `<config paths.runs_dir>/.shortsloop.lock`。真正的風險是 runs_dir 用了相對路徑。
-- runbook §4 的 resume 指令寫裸 `shortsloop`；§3、§4 的路徑寫 `runs/` → 要用 `.venv/bin/shortsloop`，路徑在 `paths.runs_dir` 底下。
-- runbook §4 的 `ig_encode.sh -a bgm.mp3 …` 少了必填的 `-o OUT` 和輸入檔。
-- runbook §6 的 `shortsloop check --l1-only` 少了 clip 路徑和 `--prompt-file`（缺了會 exit 2）→ 直接讀 `verdicts/*.l1.json`。
-- runbook §0 寫「four model filenames」→ 實際是 6 個檔；寫「~4 min」→ 實際有 452 個測試，時間還沒量；也漏了 `ollama pull qwen3:8b`。
-- runbook §1 列出可改的參數時漏了 fps，而 fps 也必須是常數輸入。
-- runbook §2c 說不加 `--with-l2` 就是 L1-only → 實際上會沿用既有的 `l2_scores.jsonl`。
-- runbook §5 寫 exit 3 = HALTED(infra) → interrupted 和 crash 也是 exit 3；judge build 在開跑時就不符是 exit 2，不是 halt。
 - plan §6（`docs/plan.md:463-464`）說簽核後的 `thresholds.yaml` 要 commit → 這份刻意不 commit：工作站上的本機 commit 會和 origin/main 分岔，`git pull --no-rebase --ff-only` 就會拒絕（`fatal: Not possible to fast-forward`，exit 128）。要改成 commit 請 owner 決定。

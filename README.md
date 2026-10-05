@@ -21,7 +21,9 @@ shortsloop report runs/<id>      # re-render a morning report
 Design in [`docs/plan.md`](docs/plan.md) (frozen contracts: verdict schema,
 exit codes, failure classes, re-roll table, stage names), decision history in
 [`docs/brainstorm.md`](docs/brainstorm.md), workstation setup in
-[`docs/runbook.md`](docs/runbook.md), hard rules in [`CLAUDE.md`](CLAUDE.md).
+[`docs/runbook.md`](docs/runbook.md) (step-by-step zh-TW checklist:
+[`docs/workstation-checklist.md`](docs/workstation-checklist.md)), hard rules in
+[`CLAUDE.md`](CLAUDE.md).
 
 Principles: the verdict comes from the checker's exit code, nothing else; fail
 closed everywhere; Wan and the VLM never share VRAM (verified, not assumed);
@@ -30,5 +32,5 @@ from append-only JSONL.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -q   # ~300 tests, CPU-only: synthetic fixtures + fake ComfyUI/judge
+.venv/bin/pytest -q   # 453 tests (~15 min), CPU-only: synthetic fixtures + fake ComfyUI/judge
 ```
